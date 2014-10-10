@@ -14,7 +14,7 @@ ChucK sourcecode
 Csound 6 (preferably compiled from source)
 libsndfile (required by Csound and Chuck)
 
-0. Compile Csound. Instructions (and dependencies) for compilation can be found [https://github.com/csound/csound/blob/develop/BUILD.md](here).
+0. Compile Csound. Instructions (and dependencies) for compilation can be found [here](https://github.com/csound/csound/blob/develop/BUILD.md).
 1. Download the most reason of ChucK (in this case, it was 1.3.4.0) and extract it
 2. Place the blackbox directory in src/
 3. In the blackbox directory, there is a file called blackbox.patch. Place it in the top level of the Chuck directory
