@@ -1,0 +1,2363 @@
+diff -rupN OLD/chuck-1.3.3.0-reverbSC.patch chuck-1.3.4.0/chuck-1.3.3.0-reverbSC.patch
+--- OLD/chuck-1.3.3.0-reverbSC.patch	1969-12-31 19:00:00.000000000 -0500
++++ chuck-1.3.4.0/chuck-1.3.3.0-reverbSC.patch	2014-10-04 16:50:26.261441664 -0400
+@@ -0,0 +1,939 @@
++diff -rupN chuck-1.3.3.0/src/chuck_compile.cpp chuck-1.3.3.0-reverbSC/src/chuck_compile.cpp
++--- chuck-1.3.3.0/src/chuck_compile.cpp	2013-08-22 13:20:59.000000000 -0400
+++++ chuck-1.3.3.0-reverbSC/src/chuck_compile.cpp	2014-03-06 06:52:06.062730100 -0500
++@@ -47,6 +47,8 @@
++ #include "ulib_regex.h"
++ #include "chuck_io.h"
++ 
+++#include "ugen_reverbsc.h"
+++
++ #if defined(__PLATFORM_WIN32__)
++ #include "dirent_win32.h"
++ #endif
++@@ -588,11 +590,14 @@ t_CKBOOL load_internal_modules( Chuck_Co
++     EM_log( CK_LOG_SEVERE, "class 'RegEx'..." );
++     if( !load_module( env, regex_query, "RegEx", "global" ) ) goto error;
++     // if( !load_module( env, net_query, "net", "global" ) ) goto error;
++-    
+++   
+++	EM_log( CK_LOG_SEVERE, "class 'ReverbSC' ...");
+++    if( !load_module( env, revsc_query, "ReverbSC", "global" ) ) goto error;
+++
++     if( !init_class_HID( env ) ) goto error;
++     if( !init_class_serialio( env ) ) goto error;
++-        
++-    // clear context
+++
+++    //clear context
++     type_engine_unload_context( env );
++     
++     // commit what is in the type checker at this point
++diff -rupN chuck-1.3.3.0/src/makefile chuck-1.3.3.0-reverbSC/src/makefile
++--- chuck-1.3.3.0/src/makefile	2013-11-26 03:37:55.000000000 -0500
+++++ chuck-1.3.3.0-reverbSC/src/makefile	2014-03-06 06:52:45.701733379 -0500
++@@ -85,7 +85,7 @@ CXXSRCS+= chuck_absyn.cpp chuck_parse.cp
++ 	ugen_stk.cpp ugen_xxx.cpp ulib_machine.cpp ulib_math.cpp ulib_std.cpp \
++ 	ulib_opsc.cpp ulib_regex.cpp util_buffers.cpp util_console.cpp \
++ 	util_string.cpp util_thread.cpp util_opsc.cpp util_serial.cpp \
++-	util_hid.cpp uana_xform.cpp uana_extract.cpp
+++	util_hid.cpp uana_xform.cpp uana_extract.cpp ugen_reverbsc.cpp
++ LO_CSRCS+= lo/address.c lo/blob.c lo/bundle.c lo/message.c lo/method.c \
++     lo/pattern_match.c lo/send.c lo/server.c lo/server_thread.c lo/timetag.c
++ 
++diff -rupN chuck-1.3.3.0/src/makefile.jack chuck-1.3.3.0-reverbSC/src/makefile.jack
++--- chuck-1.3.3.0/src/makefile.jack	2013-10-30 07:01:03.000000000 -0400
+++++ chuck-1.3.3.0-reverbSC/src/makefile.jack	2014-03-06 01:37:25.616178619 -0500
++@@ -2,3 +2,5 @@
++ CFLAGS+= -D__UNIX_JACK__ -D__PLATFORM_LINUX__ -O3 -fno-strict-aliasing -D__CK_SNDFILE_NATIVE__
++ LDFLAGS+= -lasound -ljack -lstdc++ -ldl -lm -lsndfile -lpthread
++ 
+++#ugen_clip.o: ugen_clip.h ugen_clip.cpp
+++#	$(CXX) $(FLAGS) ugen_clip.cpp
++diff -rupN chuck-1.3.3.0/src/rec.ck chuck-1.3.3.0-reverbSC/src/rec.ck
++--- chuck-1.3.3.0/src/rec.ck	1969-12-31 19:00:00.000000000 -0500
+++++ chuck-1.3.3.0-reverbSC/src/rec.ck	2014-03-06 06:19:23.113568815 -0500
++@@ -0,0 +1,23 @@
+++// chuck this with other shreds to record to file
+++// example> chuck foo.ck bar.ck rec (see also rec2.ck)
+++
+++// arguments: rec:<filename>
+++
+++// get name
+++me.arg(0) => string filename;
+++if( filename.length() == 0 ) "foo.wav" => filename;
+++
+++// pull samples from the dac
+++dac => Gain g => WvOut w => blackhole;
+++// this is the output file name
+++filename => w.wavFilename;
+++<<<"writing to file:", "'" + w.filename() + "'">>>;
+++// any gain you want for the output
+++.5 => g.gain;
+++
+++// temporary workaround to automatically close file on remove-shred
+++null @=> w;
+++
+++// infinite time loop...
+++// ctrl-c will stop it, or modify to desired duration
+++while( true ) 1::second => now;
++diff -rupN chuck-1.3.3.0/src/reverbsc.c chuck-1.3.3.0-reverbSC/src/reverbsc.c
++--- chuck-1.3.3.0/src/reverbsc.c	1969-12-31 19:00:00.000000000 -0500
+++++ chuck-1.3.3.0-reverbSC/src/reverbsc.c	2014-03-06 03:51:41.311840597 -0500
++@@ -0,0 +1,296 @@
+++/*
+++    reverbsc.c:
+++
+++    8 delay line FDN reverb, with feedback matrix based upon
+++    physical modeling scattering junction of 8 lossless waveguides
+++    of equal characteristic impedance. Based on Julius O. Smith III,
+++    "A New Approach to Digital Reverberation using Closed Waveguide
+++    Networks," Proceedings of the International Computer Music
+++    Conference 1985, p. 47-53 (also available as a seperate
+++    publication from CCRMA), as well as some more recent papers by
+++    Smith and others.
+++
+++    Csound orchestra version coded by Sean Costello, October 1999
+++
+++    C implementation (C) 2005 Istvan Varga
+++
+++    This file is part of Csound.
+++
+++    The Csound Library is free software; you can redistribute it
+++    and/or modify it under the terms of the GNU Lesser General Public
+++    License as published by the Free Software Foundation; either
+++    version 2.1 of the License, or (at your option) any later version.
+++
+++    Csound is distributed in the hope that it will be useful,
+++    but WITHOUT ANY WARRANTY; without even the implied warranty of
+++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+++    GNU Lesser General Public License for more details.
+++
+++    You should have received a copy of the GNU Lesser General Public
+++    License along with Csound; if not, write to the Free Software
+++    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
+++    02111-1307 USA
+++*/
+++
+++#include <math.h>
+++#include <stdio.h>
+++#include <stdlib.h>
+++#include <string.h>
+++
+++#include "core.h"
+++#include "fx.h"
+++
+++
+++#define DEFAULT_SRATE   44100.0
+++#define MIN_SRATE       5000.0
+++#define MAX_SRATE       1000000.0
+++#define MAX_PITCHMOD    20.0
+++#define DELAYPOS_SHIFT  28
+++#define DELAYPOS_SCALE  0x10000000
+++#define DELAYPOS_MASK   0x0FFFFFFF
+++
+++/* reverbParams[n][0] = delay time (in seconds)                     */
+++/* reverbParams[n][1] = random variation in delay time (in seconds) */
+++/* reverbParams[n][2] = random variation frequency (in 1/sec)       */
+++/* reverbParams[n][3] = random seed (0 - 32767)                     */
+++
+++static const double reverbParams[8][4] = {
+++    { (2473.0 / DEFAULT_SRATE), 0.0010, 3.100,  1966.0 },
+++    { (2767.0 / DEFAULT_SRATE), 0.0011, 3.500, 29491.0 },
+++    { (3217.0 / DEFAULT_SRATE), 0.0017, 1.110, 22937.0 },
+++    { (3557.0 / DEFAULT_SRATE), 0.0006, 3.973,  9830.0 },
+++    { (3907.0 / DEFAULT_SRATE), 0.0010, 2.341, 20643.0 },
+++    { (4127.0 / DEFAULT_SRATE), 0.0011, 1.897, 22937.0 },
+++    { (2143.0 / DEFAULT_SRATE), 0.0017, 0.891, 29491.0 },
+++    { (1933.0 / DEFAULT_SRATE), 0.0006, 3.221, 14417.0 }
+++};
+++
+++static const double outputGain  = 0.35;
+++static const double jpScale     = 0.25;
+++
+++typedef struct {
+++    int         writePos;
+++    int         bufferSize;
+++    int         readPos;
+++    int         readPosFrac;
+++    int         readPosFrac_inc;
+++    int         dummy;
+++    int         seedVal;
+++    int         randLine_cnt;
+++    double      filterState;
+++    MYFLT       buf[1];
+++} delayLine;
+++
+++typedef struct {
+++    //OPDS        h;
+++    MYFLT       kFeedBack, kLPFreq;
+++    MYFLT       iSampleRate, iPitchMod, iSkipInit;
+++    double      sampleRate;
+++    double      dampFact;
+++    MYFLT       prv_LPFreq;
+++    int         initDone;
+++    delayLine   *delayLines[8];
+++    AUXCH       auxData;
+++} SC_REVERB;
+++
+++static int delay_line_max_samples(SC_REVERB *p, int n)
+++{
+++    double  maxDel;
+++
+++    maxDel = reverbParams[n][0];
+++    maxDel += (reverbParams[n][1] * (double) p->iPitchMod * 1.125);
+++    return (int) (maxDel * p->sampleRate + 16.5);
+++}
+++
+++static int delay_line_bytes_alloc(SC_REVERB *p, int n)
+++{
+++    int nBytes;
+++
+++    nBytes = (int) sizeof(delayLine) - (int) sizeof(MYFLT);
+++    nBytes += (delay_line_max_samples(p, n) * (int) sizeof(MYFLT));
+++    nBytes = (nBytes + 15) & (~15);
+++    return nBytes;
+++}
+++
+++static void next_random_lineseg(SC_REVERB *p, delayLine *lp, int n)
+++{
+++    double  prvDel, nxtDel, phs_incVal;
+++
+++    /* update random seed */
+++    if (lp->seedVal < 0)
+++      lp->seedVal += 0x10000;
+++    lp->seedVal = (lp->seedVal * 15625 + 1) & 0xFFFF;
+++    if (lp->seedVal >= 0x8000)
+++      lp->seedVal -= 0x10000;
+++    /* length of next segment in samples */
+++    lp->randLine_cnt = (int) ((p->sampleRate / reverbParams[n][2]) + 0.5);
+++    prvDel = (double) lp->writePos;
+++    prvDel -= ((double) lp->readPos
+++               + ((double) lp->readPosFrac / (double) DELAYPOS_SCALE));
+++    while (prvDel < 0.0)
+++      prvDel += (double) lp->bufferSize;
+++    prvDel = prvDel / p->sampleRate;    /* previous delay time in seconds */
+++    nxtDel = (double) lp->seedVal * reverbParams[n][1] / 32768.0;
+++    /* next delay time in seconds */
+++    nxtDel = reverbParams[n][0] + (nxtDel * (double) p->iPitchMod);
+++    /* calculate phase increment per sample */
+++    phs_incVal = (prvDel - nxtDel) / (double) lp->randLine_cnt;
+++    phs_incVal = phs_incVal * p->sampleRate + 1.0;
+++    lp->readPosFrac_inc = (int) (phs_incVal * DELAYPOS_SCALE + 0.5);
+++}
+++
+++static void init_del_line(SC_REVERB *p, delayLine *lp, int n)
+++{
+++    double  readPos;
+++    /* int     i; */
+++
+++    /* calculate length of delay line */
+++    lp->bufferSize = delay_line_max_samples(p, n);
+++    lp->dummy = 0;
+++    lp->writePos = 0;
+++    /* set random seed */
+++    lp->seedVal = (int) (reverbParams[n][3] + 0.5);
+++    /* set initial delay time */
+++    readPos = (double) lp->seedVal * reverbParams[n][1] / 32768;
+++    readPos = reverbParams[n][0] + (readPos * (double) p->iPitchMod);
+++    readPos = (double) lp->bufferSize - (readPos * p->sampleRate);
+++    lp->readPos = (int) readPos;
+++    readPos = (readPos - (double) lp->readPos) * (double) DELAYPOS_SCALE;
+++    lp->readPosFrac = (int) (readPos + 0.5);
+++    /* initialise first random line segment */
+++    next_random_lineseg(p, lp, n);
+++    /* clear delay line to zero */
+++    lp->filterState = 0.0;
+++   	memset(lp->buf, 0, sizeof(MYFLT)*lp->bufferSize);
+++    //lp->buf = malloc(sizeof(MYFLT) * lp->bufferSize);
+++    /* for (i = 0; i < lp->bufferSize; i++) */
+++    /*   lp->buf[i] = FL(0.0); */
+++}
+++
+++//static int sc_reverb_init(CSOUND *csound, SC_REVERB *p)
+++int reverbsc_init(soundpipe_data *data, sp_fx *info, 
+++	double kFeedBack, double kLPFreq)
+++{
+++	SC_REVERB *p = (SC_REVERB *) info->data;
+++	p = malloc(sizeof(SC_REVERB));
+++	p->kFeedBack = kFeedBack;
+++	p->kLPFreq = kLPFreq;
+++	p->iPitchMod  = 1;
+++	p->iSampleRate = data->sr;
+++	p->sampleRate = data->sr;
+++	p->iSkipInit = 0;
+++	int i;
+++	int nBytes;
+++	nBytes = 0;
+++	for (i = 0; i < 8; i++)
+++	 nBytes += delay_line_bytes_alloc(p, i);
+++
+++	p->auxData.auxp = malloc(nBytes*sizeof(MYFLT));
+++	memset(p->auxData.auxp, 0, nBytes*sizeof(MYFLT));
+++
+++	/* set up delay lines */
+++	nBytes = 0;
+++	for (i = 0; i < 8; i++) {
+++	 p->delayLines[i] = (delayLine*) ((unsigned char*) (p->auxData.auxp)
+++							    + (int) nBytes);
+++	 init_del_line(p, p->delayLines[i], i);
+++	 nBytes += delay_line_bytes_alloc(p, i);
+++	}
+++	p->dampFact = 1.0;
+++	p->prv_LPFreq = 0.0;
+++	p->initDone = 1.0;
+++
+++	info->data = p;
+++	info->func = reverbsc;
+++	return 1;
+++}
+++
+++//static int sc_reverb_perf(CSOUND *csound, SC_REVERB *p)
+++double reverbsc(void *data, double s, sp_array params)
+++{
+++	SC_REVERB *p = (SC_REVERB*) data;
+++	double 	s1, s2;
+++	double    ainL, ainR, aoutL, aoutR;
+++	double    vm1, v0, v1, v2, am1, a0, a1, a2, frac;
+++	delayLine *lp;
+++	int       n, readPos;
+++	int       bufferSize; /* Local copy */
+++	double    dampFact = p->dampFact;
+++
+++	/* calculate tone filter coefficient if frequency changed */
+++	if (p->kLPFreq != p->prv_LPFreq) {
+++	 p->prv_LPFreq = p->kLPFreq;
+++	 dampFact = 2.0 - cos(p->prv_LPFreq * TWOPI / p->sampleRate);
+++	 dampFact = p->dampFact = dampFact - sqrt(dampFact * dampFact - 1.0);
+++	}
+++	 /* calculate "resultant junction pressure" and mix to input signals */
+++	 ainL = aoutL = aoutR = 0.0;
+++	 s1 = s;
+++	 s2 = s1;
+++	 for (n = 0; n < 8; n++)
+++	 	ainL += p->delayLines[n]->filterState;
+++	 ainL *= jpScale;
+++	 ainR = ainL + s1; 
+++	 ainL = ainL + s2;
+++	 /* loop through all delay lines */
+++	 for (n = 0; n < 8; n++) {
+++	   lp = p->delayLines[n];
+++	   bufferSize = lp->bufferSize;
+++	   /* send input signal and feedback to delay line */
+++	   lp->buf[lp->writePos] = (MYFLT) ((n & 1 ? ainR : ainL)
+++								 - lp->filterState);
+++	   if (++lp->writePos >= bufferSize)
+++		lp->writePos -= bufferSize;
+++	   /* read from delay line with cubic interpolation */
+++	   if (lp->readPosFrac >= DELAYPOS_SCALE) {
+++		lp->readPos += (lp->readPosFrac >> DELAYPOS_SHIFT);
+++		lp->readPosFrac &= DELAYPOS_MASK;
+++	   }
+++	   if (lp->readPos >= bufferSize)
+++		lp->readPos -= bufferSize;
+++	   readPos = lp->readPos;
+++	   frac = (double) lp->readPosFrac * (1.0 / (double) DELAYPOS_SCALE);
+++	   /* calculate interpolation coefficients */
+++	   a2 = frac * frac; a2 -= 1.0; a2 *= (1.0 / 6.0);
+++	   a1 = frac; a1 += 1.0; a1 *= 0.5; am1 = a1 - 1.0;
+++	   a0 = 3.0 * a2; a1 -= a0; am1 -= a2; a0 -= frac;
+++	   /* read four samples for interpolation */
+++	   if (readPos > 0 && readPos < (bufferSize - 2)) {
+++		vm1 = (double) (lp->buf[readPos - 1]);
+++		v0  = (double) (lp->buf[readPos]);
+++		v1  = (double) (lp->buf[readPos + 1]);
+++		v2  = (double) (lp->buf[readPos + 2]);
+++	   }
+++	   else {
+++		/* at buffer wrap-around, need to check index */
+++		if (--readPos < 0) readPos += bufferSize;
+++		vm1 = (double) lp->buf[readPos];
+++		if (++readPos >= bufferSize) readPos -= bufferSize;
+++		v0 = (double) lp->buf[readPos];
+++		if (++readPos >= bufferSize) readPos -= bufferSize;
+++		v1 = (double) lp->buf[readPos];
+++		if (++readPos >= bufferSize) readPos -= bufferSize;
+++		v2 = (double) lp->buf[readPos];
+++	   }
+++	   v0 = (am1 * vm1 + a0 * v0 + a1 * v1 + a2 * v2) * frac + v0;
+++	   /* update buffer read position */
+++	   lp->readPosFrac += lp->readPosFrac_inc;
+++	   /* apply feedback gain and lowpass filter */
+++	   v0 *= (double) p->kFeedBack;
+++	   v0 = (lp->filterState - v0) * dampFact + v0;
+++	   lp->filterState = v0;
+++	   /* mix to output */
+++	   if (n & 1)
+++		aoutR += v0;
+++	   else
+++		aoutL += v0;
+++	   /* start next random line segment if current one has reached endpoint */
+++	   if (--(lp->randLine_cnt) <= 0)
+++		next_random_lineseg(p, lp, n);
+++	 }
+++	 //p->aoutL[i] = (MYFLT) (aoutL * outputGain);
+++	 //p->aoutR[i] = (MYFLT) (aoutR * outputGain);
+++	return aoutL * outputGain; 		
+++	//return ainL;
+++}
+++
++Binary files chuck-1.3.3.0/src/reverbsc_demo.mp3 and chuck-1.3.3.0-reverbSC/src/reverbsc_demo.mp3 differ
++Binary files chuck-1.3.3.0/src/reverbsc_demo.wav and chuck-1.3.3.0-reverbSC/src/reverbsc_demo.wav differ
++diff -rupN chuck-1.3.3.0/src/ugen_reverbsc.cpp chuck-1.3.3.0-reverbSC/src/ugen_reverbsc.cpp
++--- chuck-1.3.3.0/src/ugen_reverbsc.cpp	1969-12-31 19:00:00.000000000 -0500
+++++ chuck-1.3.3.0-reverbSC/src/ugen_reverbsc.cpp	2014-03-06 04:58:44.114171172 -0500
++@@ -0,0 +1,474 @@
+++/*
+++    reverbsc.c:
+++
+++    8 delay line FDN reverb, with feedback matrix based upon
+++    physical modeling scattering junction of 8 lossless waveguides
+++    of equal characteristic impedance. Based on Julius O. Smith III,
+++    "A New Approach to Digital Reverberation using Closed Waveguide
+++    Networks," Proceedings of the International Computer Music
+++    Conference 1985, p. 47-53 (also available as a seperate
+++    publication from CCRMA), as well as some more recent papers by
+++    Smith and others.
+++
+++    Csound orchestra version coded by Sean Costello, October 1999
+++
+++    C implementation (C) 2005 Istvan Varga
+++	
+++	Chuck Implementation by Paul Batchelor, March 2014
+++*/
+++#include "ugen_reverbsc.h"
+++#include "chuck_type.h"
+++#include "chuck_ugen.h"
+++#include "chuck_vm.h"
+++#include "chuck_globals.h"
+++
+++#ifndef TWOPI
+++#define TWOPI   (6.28318530717958647692)
+++#endif
+++
+++static t_CKUINT g_srate = 0;
+++
+++#define BUFFER_SIZE 1024
+++typedef struct {
+++int sr;
+++long c; 
+++} soundpipe_data;
+++
+++typedef struct {
+++int size;
+++double *arr;
+++}sp_array;
+++
+++typedef struct auxch {
+++	size_t  size;
+++	void    *auxp;
+++} AUXCH;
+++
+++typedef struct{
+++	double (*func)(void *, double, sp_array);
+++	void *data;
+++}sp_fx;
+++
+++/* Begin port of reverbsc opcode */
+++//int reverbsc_init(soundpipe_data *data, sp_fx *info, 
+++//	double kFeedBack, double kLPFreq);
+++//double reverbsc(void *data, double s, sp_array params);
+++
+++
+++
+++
+++#include <math.h>
+++#include <stdio.h>
+++#include <stdlib.h>
+++#include <string.h>
+++
+++#define DEFAULT_SRATE   44100.0
+++#define MIN_SRATE       5000.0
+++#define MAX_SRATE       1000000.0
+++#define MAX_PITCHMOD    20.0
+++#define DELAYPOS_SHIFT  28
+++#define DELAYPOS_SCALE  0x10000000
+++#define DELAYPOS_MASK   0x0FFFFFFF
+++
+++///* reverbParams[n][0] = delay time (in seconds)                     */
+++///* reverbParams[n][1] = random variation in delay time (in seconds) */
+++///* reverbParams[n][2] = random variation frequency (in 1/sec)       */
+++///* reverbParams[n][3] = random seed (0 - 32767)                     */
+++//
+++static const double reverbParams[8][4] = {
+++    { (2473.0 / DEFAULT_SRATE), 0.0010, 3.100,  1966.0 },
+++    { (2767.0 / DEFAULT_SRATE), 0.0011, 3.500, 29491.0 },
+++    { (3217.0 / DEFAULT_SRATE), 0.0017, 1.110, 22937.0 },
+++    { (3557.0 / DEFAULT_SRATE), 0.0006, 3.973,  9830.0 },
+++    { (3907.0 / DEFAULT_SRATE), 0.0010, 2.341, 20643.0 },
+++    { (4127.0 / DEFAULT_SRATE), 0.0011, 1.897, 22937.0 },
+++    { (2143.0 / DEFAULT_SRATE), 0.0017, 0.891, 29491.0 },
+++    { (1933.0 / DEFAULT_SRATE), 0.0006, 3.221, 14417.0 }
+++};
+++
+++static const double outputGain  = 0.35;
+++static const double jpScale     = 0.25;
+++
+++typedef struct {
+++    int         writePos;
+++    int         bufferSize;
+++    int         readPos;
+++    int         readPosFrac;
+++    int         readPosFrac_inc;
+++    int         dummy;
+++    int         seedVal;
+++    int         randLine_cnt;
+++    double      filterState;
+++    MYFLT       buf[1];
+++} delayLine;
+++
+++typedef struct {
+++    MYFLT       kFeedBack, kLPFreq;
+++    MYFLT       iSampleRate, iPitchMod, iSkipInit;
+++    double      sampleRate;
+++    double      dampFact;
+++    MYFLT       prv_LPFreq;
+++    int         initDone;
+++    delayLine   *delayLines[8];
+++    AUXCH       auxData;
+++} SC_REVERB;
+++
+++static int delay_line_max_samples(SC_REVERB *p, int n)
+++{
+++    double  maxDel;
+++
+++    maxDel = reverbParams[n][0];
+++    maxDel += (reverbParams[n][1] * (double) p->iPitchMod * 1.125);
+++    return (int) (maxDel * p->sampleRate + 16.5);
+++}
+++
+++static int delay_line_bytes_alloc(SC_REVERB *p, int n)
+++{
+++    int nBytes;
+++
+++    nBytes = (int) sizeof(delayLine) - (int) sizeof(MYFLT);
+++    nBytes += (delay_line_max_samples(p, n) * (int) sizeof(MYFLT));
+++    nBytes = (nBytes + 15) & (~15);
+++    return nBytes;
+++}
+++
+++static void next_random_lineseg(SC_REVERB *p, delayLine *lp, int n)
+++{
+++    double  prvDel, nxtDel, phs_incVal;
+++
+++    /* update random seed */
+++    if (lp->seedVal < 0)
+++      lp->seedVal += 0x10000;
+++    lp->seedVal = (lp->seedVal * 15625 + 1) & 0xFFFF;
+++    if (lp->seedVal >= 0x8000)
+++      lp->seedVal -= 0x10000;
+++    /* length of next segment in samples */
+++    lp->randLine_cnt = (int) ((p->sampleRate / reverbParams[n][2]) + 0.5);
+++    prvDel = (double) lp->writePos;
+++    prvDel -= ((double) lp->readPos
+++               + ((double) lp->readPosFrac / (double) DELAYPOS_SCALE));
+++    while (prvDel < 0.0)
+++      prvDel += (double) lp->bufferSize;
+++    prvDel = prvDel / p->sampleRate;    /* previous delay time in seconds */
+++    nxtDel = (double) lp->seedVal * reverbParams[n][1] / 32768.0;
+++    /* next delay time in seconds */
+++    nxtDel = reverbParams[n][0] + (nxtDel * (double) p->iPitchMod);
+++    /* calculate phase increment per sample */
+++    phs_incVal = (prvDel - nxtDel) / (double) lp->randLine_cnt;
+++    phs_incVal = phs_incVal * p->sampleRate + 1.0;
+++    lp->readPosFrac_inc = (int) (phs_incVal * DELAYPOS_SCALE + 0.5);
+++}
+++
+++static void init_del_line(SC_REVERB *p, delayLine *lp, int n)
+++{
+++    double  readPos;
+++    /* int     i; */
+++
+++    /* calculate length of delay line */
+++    lp->bufferSize = delay_line_max_samples(p, n);
+++    lp->dummy = 0;
+++    lp->writePos = 0;
+++    /* set random seed */
+++    lp->seedVal = (int) (reverbParams[n][3] + 0.5);
+++    /* set initial delay time */
+++    readPos = (double) lp->seedVal * reverbParams[n][1] / 32768;
+++    readPos = reverbParams[n][0] + (readPos * (double) p->iPitchMod);
+++    readPos = (double) lp->bufferSize - (readPos * p->sampleRate);
+++    lp->readPos = (int) readPos;
+++    readPos = (readPos - (double) lp->readPos) * (double) DELAYPOS_SCALE;
+++    lp->readPosFrac = (int) (readPos + 0.5);
+++    /* initialise first random line segment */
+++    next_random_lineseg(p, lp, n);
+++    /* clear delay line to zero */
+++    lp->filterState = 0.0;
+++   	memset(lp->buf, 0, sizeof(MYFLT)*lp->bufferSize);
+++    //lp->buf = malloc(sizeof(MYFLT) * lp->bufferSize);
+++    /* for (i = 0; i < lp->bufferSize; i++) */
+++    /*   lp->buf[i] = FL(0.0); */
+++}
+++
+++//static int sc_reverb_init(CSOUND *csound, SC_REVERB *p)
+++int reverbsc_init(SC_REVERB *p, 
+++	double kFeedBack, double kLPFreq)
+++{
+++	p->kFeedBack = kFeedBack;
+++	p->kLPFreq = kLPFreq;
+++	p->iPitchMod  = 1;
+++	p->iSampleRate = g_srate;
+++	p->sampleRate = g_srate;
+++	p->iSkipInit = 0;
+++	int i;
+++	int nBytes;
+++	nBytes = 0;
+++	for (i = 0; i < 8; i++)
+++	 nBytes += delay_line_bytes_alloc(p, i);
+++
+++	p->auxData.auxp = malloc(nBytes*sizeof(MYFLT));
+++	memset(p->auxData.auxp, 0, nBytes*sizeof(MYFLT));
+++
+++	/* set up delay lines */
+++	nBytes = 0;
+++	for (i = 0; i < 8; i++) {
+++	 p->delayLines[i] = (delayLine*) ((unsigned char*) (p->auxData.auxp)
+++							    + (int) nBytes);
+++	 init_del_line(p, p->delayLines[i], i);
+++	 nBytes += delay_line_bytes_alloc(p, i);
+++	}
+++	p->dampFact = 1.0;
+++	p->prv_LPFreq = 0.0;
+++	p->initDone = 1.0;
+++	return 1;
+++}
+++
+++//static int sc_reverb_perf(CSOUND *csound, SC_REVERB *p)
+++double reverbsc(SC_REVERB *p, double s)
+++{
+++	double 	s1, s2;
+++	double    ainL, ainR, aoutL, aoutR;
+++	double    vm1, v0, v1, v2, am1, a0, a1, a2, frac;
+++	delayLine *lp;
+++	int       n, readPos;
+++	int       bufferSize; /* Local copy */
+++	double    dampFact = p->dampFact;
+++
+++	/* calculate tone filter coefficient if frequency changed */
+++	if (p->kLPFreq != p->prv_LPFreq) {
+++	 p->prv_LPFreq = p->kLPFreq;
+++	 dampFact = 2.0 - cos(p->prv_LPFreq * TWOPI / p->sampleRate);
+++	 dampFact = p->dampFact = dampFact - sqrt(dampFact * dampFact - 1.0);
+++	}
+++	 /* calculate "resultant junction pressure" and mix to input signals */
+++	 ainL = aoutL = aoutR = 0.0;
+++	 s1 = s;
+++	 s2 = s1;
+++	 for (n = 0; n < 8; n++)
+++	 	ainL += p->delayLines[n]->filterState;
+++	 ainL *= jpScale;
+++	 ainR = ainL + s1; 
+++	 ainL = ainL + s2;
+++	 /* loop through all delay lines */
+++	 for (n = 0; n < 8; n++) {
+++	   lp = p->delayLines[n];
+++	   bufferSize = lp->bufferSize;
+++	   /* send input signal and feedback to delay line */
+++	   lp->buf[lp->writePos] = (MYFLT) ((n & 1 ? ainR : ainL)
+++								 - lp->filterState);
+++	   if (++lp->writePos >= bufferSize)
+++		lp->writePos -= bufferSize;
+++	   /* read from delay line with cubic interpolation */
+++	   if (lp->readPosFrac >= DELAYPOS_SCALE) {
+++		lp->readPos += (lp->readPosFrac >> DELAYPOS_SHIFT);
+++		lp->readPosFrac &= DELAYPOS_MASK;
+++	   }
+++	   if (lp->readPos >= bufferSize)
+++		lp->readPos -= bufferSize;
+++	   readPos = lp->readPos;
+++	   frac = (double) lp->readPosFrac * (1.0 / (double) DELAYPOS_SCALE);
+++	   /* calculate interpolation coefficients */
+++	   a2 = frac * frac; a2 -= 1.0; a2 *= (1.0 / 6.0);
+++	   a1 = frac; a1 += 1.0; a1 *= 0.5; am1 = a1 - 1.0;
+++	   a0 = 3.0 * a2; a1 -= a0; am1 -= a2; a0 -= frac;
+++	   /* read four samples for interpolation */
+++	   if (readPos > 0 && readPos < (bufferSize - 2)) {
+++		vm1 = (double) (lp->buf[readPos - 1]);
+++		v0  = (double) (lp->buf[readPos]);
+++		v1  = (double) (lp->buf[readPos + 1]);
+++		v2  = (double) (lp->buf[readPos + 2]);
+++	   }
+++	   else {
+++		/* at buffer wrap-around, need to check index */
+++		if (--readPos < 0) readPos += bufferSize;
+++		vm1 = (double) lp->buf[readPos];
+++		if (++readPos >= bufferSize) readPos -= bufferSize;
+++		v0 = (double) lp->buf[readPos];
+++		if (++readPos >= bufferSize) readPos -= bufferSize;
+++		v1 = (double) lp->buf[readPos];
+++		if (++readPos >= bufferSize) readPos -= bufferSize;
+++		v2 = (double) lp->buf[readPos];
+++	   }
+++	   v0 = (am1 * vm1 + a0 * v0 + a1 * v1 + a2 * v2) * frac + v0;
+++	   /* update buffer read position */
+++	   lp->readPosFrac += lp->readPosFrac_inc;
+++	   /* apply feedback gain and lowpass filter */
+++	   v0 *= (double) p->kFeedBack;
+++	   v0 = (lp->filterState - v0) * dampFact + v0;
+++	   lp->filterState = v0;
+++	   /* mix to output */
+++	   if (n & 1)
+++		aoutR += v0;
+++	   else
+++		aoutL += v0;
+++	   /* start next random line segment if current one has reached endpoint */
+++	   if (--(lp->randLine_cnt) <= 0)
+++		next_random_lineseg(p, lp, n);
+++	 }
+++	 //p->aoutL[i] = (MYFLT) (aoutL * outputGain);
+++	 //p->aoutR[i] = (MYFLT) (aoutR * outputGain);
+++	return aoutL * outputGain; 		
+++	//return ainL;
+++}
+++
+++
+++
+++struct Rev_Data
+++{
+++	SAMPLE max;
+++	SAMPLE min;
+++	SAMPLE mix;
+++	SAMPLE size;
+++	SAMPLE cutoff;
+++	SC_REVERB p;
+++	Rev_Data( ){
+++				max = 1.0f; 
+++				min = -1.0f; 
+++				mix = 0.5;
+++				size = 0.98f; 
+++				cutoff = 10000;}
+++	};
+++
+++static t_CKUINT revsc_offset_data = 0;
+++
+++DLL_QUERY revsc_query( Chuck_DL_Query * QUERY)
+++{
+++	Chuck_Env *env = Chuck_Env::instance();
+++	Chuck_DL_Func * func = NULL;
+++
+++	g_srate = QUERY->srate;
+++
+++	if(!type_engine_import_ugen_begin( 	env, "ReverbSC", "UGen", env->global(), 
+++										revsc_ctor, revsc_dtor, revsc_tick, NULL) )
+++	return FALSE;
+++
+++
+++	//add member function
+++	revsc_offset_data = type_engine_import_mvar(env, "int", "@revsc_data", FALSE);
+++	if( revsc_offset_data == CK_INVALID_OFFSET) goto error;	
+++
+++	//add ctrl max
+++	func = make_new_mfun( "float", "max", revsc_ctrl_max );
+++	func->add_arg( "float", "max" );
+++	if( !type_engine_import_mfun( env, func ) ) goto error;
+++
+++	//add cget max
+++	func = make_new_mfun( "float", "max", revsc_cget_max );
+++	if( !type_engine_import_mfun( env, func ) ) goto error;
+++	
+++	//add ctrl min
+++	func = make_new_mfun( "float", "min", revsc_ctrl_min );
+++	func->add_arg( "float", "min" );
+++	if( !type_engine_import_mfun( env, func ) ) goto error;
+++
+++	//add cget min
+++	func = make_new_mfun( "float", "min", revsc_cget_min );
+++	if( !type_engine_import_mfun( env, func ) ) goto error;
+++	
+++	//add ctrl mix
+++	func = make_new_mfun( "float", "mix", revsc_ctrl_mix );
+++	func->add_arg( "float", "mix" );
+++	if( !type_engine_import_mfun( env, func ) ) goto error;
+++
+++	//add cget mix
+++	func = make_new_mfun( "float", "mix", revsc_cget_mix );
+++	if( !type_engine_import_mfun( env, func ) ) goto error;
+++	
+++	//add ctrl size
+++	func = make_new_mfun( "float", "size", revsc_ctrl_size );
+++	func->add_arg( "float", "size" );
+++	if( !type_engine_import_mfun( env, func ) ) goto error;
+++
+++	//add cget size
+++	func = make_new_mfun( "float", "size", revsc_cget_size );
+++	if( !type_engine_import_mfun( env, func ) ) goto error;
+++	
+++	//add ctrl cutoff
+++	func = make_new_mfun( "float", "cutoff", revsc_ctrl_cutoff );
+++	func->add_arg( "float", "cutoff" );
+++	if( !type_engine_import_mfun( env, func ) ) goto error;
+++
+++	//add cget cutoff
+++	func = make_new_mfun( "float", "cutoff", revsc_cget_cutoff );
+++	if( !type_engine_import_mfun( env, func ) ) goto error;
+++
+++error:	
+++	if(!type_engine_import_class_end( env ))
+++		return FALSE;
+++
+++	return TRUE;
+++}
+++
+++CK_DLL_CTOR ( revsc_ctor )
+++{
+++	OBJ_MEMBER_UINT(SELF, revsc_offset_data) = (t_CKUINT)new Rev_Data;
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	reverbsc_init(&d->p, d->size, d->cutoff);
+++}
+++CK_DLL_DTOR ( revsc_dtor )
+++{
+++	delete (Rev_Data *) OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	OBJ_MEMBER_UINT(SELF, revsc_offset_data) = 0;
+++}
+++
+++CK_DLL_TICK( revsc_tick )
+++{
+++	Rev_Data *d = (Rev_Data *)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	//*out = in > d->max ? d->max : (in < d->min ? d->min : in);
+++	*out = in * (1 - d->mix) + reverbsc(&d->p, in) * d->mix;
+++	return TRUE;
+++}
+++
+++CK_DLL_CTRL( revsc_ctrl_max )
+++{
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	d->max = (SAMPLE)GET_CK_FLOAT(ARGS);
+++	RETURN->v_float = (t_CKFLOAT)(d->max); } CK_DLL_CGET( revsc_cget_max ) {
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	RETURN->v_float = (t_CKFLOAT)(d->max);
+++}
+++
+++CK_DLL_CTRL( revsc_ctrl_min )
+++{
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	d->min = (SAMPLE)GET_CK_FLOAT(ARGS);
+++	RETURN->v_float = (t_CKFLOAT)(d->min);
+++}
+++CK_DLL_CGET( revsc_cget_min )
+++{
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	RETURN->v_float = (t_CKFLOAT)(d->min);
+++}
+++
+++CK_DLL_CTRL( revsc_ctrl_mix )
+++{
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	d->mix = (SAMPLE)GET_CK_FLOAT(ARGS);
+++	RETURN->v_float = (t_CKFLOAT)(d->mix);
+++}
+++CK_DLL_CGET( revsc_cget_mix )
+++{
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	RETURN->v_float = (t_CKFLOAT)(d->mix);
+++}
+++CK_DLL_CTRL( revsc_ctrl_size )
+++{
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	d->size = (SAMPLE)GET_CK_FLOAT(ARGS);
+++	d->p.kFeedBack= d->size;
+++	RETURN->v_float = (t_CKFLOAT)(d->size);
+++}
+++CK_DLL_CGET( revsc_cget_size )
+++{
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	RETURN->v_float = (t_CKFLOAT)(d->size);
+++}
+++CK_DLL_CTRL( revsc_ctrl_cutoff )
+++{
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	d->cutoff = (SAMPLE)GET_CK_FLOAT(ARGS);
+++	d->p.kLPFreq = d->cutoff;
+++	RETURN->v_float = (t_CKFLOAT)(d->cutoff);
+++}
+++CK_DLL_CGET( revsc_cget_cutoff )
+++{
+++	Rev_Data *d = (Rev_Data*)OBJ_MEMBER_UINT(SELF, revsc_offset_data);
+++	RETURN->v_float = (t_CKFLOAT)(d->cutoff);
+++}
++diff -rupN chuck-1.3.3.0/src/ugen_reverbsc.h chuck-1.3.3.0-reverbSC/src/ugen_reverbsc.h
++--- chuck-1.3.3.0/src/ugen_reverbsc.h	1969-12-31 19:00:00.000000000 -0500
+++++ chuck-1.3.3.0-reverbSC/src/ugen_reverbsc.h	2014-03-06 04:58:05.437167992 -0500
++@@ -0,0 +1,31 @@
+++#ifndef __UGEN_REVERBSC_H__
+++#define __UGEN_REVERBSC_H__
+++
+++#define OK 1
+++#define MYFLT double 
+++
+++#include "chuck_dl.h"
+++
+++#endif
+++
+++DLL_QUERY revsc_query( Chuck_DL_Query * query );
+++
+++CK_DLL_TICK ( revsc_tick );
+++
+++CK_DLL_CTOR ( revsc_ctor );
+++CK_DLL_DTOR ( revsc_dtor );
+++
+++CK_DLL_CTRL( revsc_ctrl_max );
+++CK_DLL_CGET( revsc_cget_max );
+++
+++CK_DLL_CTRL( revsc_ctrl_min );
+++CK_DLL_CGET( revsc_cget_min );
+++
+++CK_DLL_CTRL( revsc_ctrl_size );
+++CK_DLL_CGET( revsc_cget_size );
+++
+++CK_DLL_CTRL( revsc_ctrl_cutoff );
+++CK_DLL_CGET( revsc_cget_cutoff );
+++
+++CK_DLL_CTRL( revsc_ctrl_mix );
+++CK_DLL_CGET( revsc_cget_mix );
++diff -rupN chuck-1.3.3.0/test_reverbsc.ck chuck-1.3.3.0-reverbSC/test_reverbsc.ck
++--- chuck-1.3.3.0/test_reverbsc.ck	1969-12-31 19:00:00.000000000 -0500
+++++ chuck-1.3.3.0-reverbSC/test_reverbsc.ck	2014-03-06 06:51:04.012725024 -0500
++@@ -0,0 +1,42 @@
+++Gain g => LPF l => ReverbSC r => ADSR fade => dac;
+++
+++0.3 => r.mix;
+++0.98 => r.size;
+++15000 => r.cutoff;
+++1000 => l.freq;
+++2 => l.Q;
+++0.8 => r.gain;
+++0.1 => g.gain;
+++
+++120 => float totaltime;
+++now + totaltime::second => time later;
+++fade.set(10::ms, 0::ms, 1, 10::second);
+++fun void note(int n, float t, float del)
+++{
+++	SawOsc s => Envelope e => g;
+++	del::second => now;
+++	while(now < later) 
+++	{
+++		1 => e.time;
+++		Std.mtof(n) => s.freq;
+++		e.keyOn();
+++		4::second => now;
+++		e.keyOff();
+++		t::second => now;
+++	}
+++}
+++
+++spork ~ note(58, 4, 0);
+++spork ~ note(65, 5, 3);
+++spork ~ note(60, 4, 6);
+++spork ~ note(69, 6, 24);
+++spork ~ note(72, 6.5, 30);
+++spork ~ note(74, 7, 70);
+++spork ~ note(81, 9, 71);
+++spork ~ note(46, 4, 50);
+++spork ~ note(34, 9.5, 53);
+++
+++fade.keyOn();
+++totaltime::second => now;
+++fade.keyOff();
+++10::second => now;
+diff -rupN OLD/.gitignore chuck-1.3.4.0/.gitignore
+--- OLD/.gitignore	1969-12-31 19:00:00.000000000 -0500
++++ chuck-1.3.4.0/.gitignore	2014-10-08 19:23:33.083974438 -0400
+@@ -0,0 +1,3 @@
++*.wav
++*.o
++*.d
+diff -rupN OLD/src/chuck_compile.cpp chuck-1.3.4.0/src/chuck_compile.cpp
+--- OLD/src/chuck_compile.cpp	2014-10-09 10:04:49.907117341 -0400
++++ chuck-1.3.4.0/src/chuck_compile.cpp	2014-10-04 16:58:35.263866498 -0400
+@@ -47,6 +47,8 @@
+ #include "ulib_regex.h"
+ #include "chuck_io.h"
+ 
++#include "blackbox/blackbox.h"
++
+ #if defined(__PLATFORM_WIN32__)
+ #include "dirent_win32.h"
+ #endif
+@@ -590,11 +592,13 @@ t_CKBOOL load_internal_modules( Chuck_Co
+     EM_log( CK_LOG_SEVERE, "class 'RegEx'..." );
+     if( !load_module( env, regex_query, "RegEx", "global" ) ) goto error;
+     // if( !load_module( env, net_query, "net", "global" ) ) goto error;
+-    
++  
++    #include "blackbox/modules.c" 
++
+     if( !init_class_HID( env ) ) goto error;
+     if( !init_class_serialio( env ) ) goto error;
+-        
+-    // clear context
++
++    //clear context
+     type_engine_unload_context( env );
+     
+     // commit what is in the type checker at this point
+diff -rupN OLD/src/chuck_compile.cpp.orig chuck-1.3.4.0/src/chuck_compile.cpp.orig
+--- OLD/src/chuck_compile.cpp.orig	1969-12-31 19:00:00.000000000 -0500
++++ chuck-1.3.4.0/src/chuck_compile.cpp.orig	2014-03-26 03:31:39.000000000 -0400
+@@ -0,0 +1,840 @@
++/*----------------------------------------------------------------------------
++  ChucK Concurrent, On-the-fly Audio Programming Language
++    Compiler and Virtual Machine
++
++  Copyright (c) 2004 Ge Wang and Perry R. Cook.  All rights reserved.
++    http://chuck.stanford.edu/
++    http://chuck.cs.princeton.edu/
++
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of the GNU General Public License as published by
++  the Free Software Foundation; either version 2 of the License, or
++  (at your option) any later version.
++
++  This program is distributed in the hope that it will be useful,
++  but WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++  GNU General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
++  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307
++  U.S.A.
++-----------------------------------------------------------------------------*/
++
++//-----------------------------------------------------------------------------
++// file: chuck_compile.cpp
++// desc: chuck compile system unifying parser, type checker, and emitter
++//
++// author: Ge Wang (ge@ccrma.stanford.edu | gewang@cs.princeton.edu)
++// date: Autumn 2005 - original
++//-----------------------------------------------------------------------------
++#include "chuck_compile.h"
++#include "chuck_lang.h"
++#include "chuck_errmsg.h"
++#include "chuck_otf.h"
++
++#include "ugen_osc.h"
++#include "ugen_xxx.h"
++#include "ugen_filter.h"
++#include "ugen_stk.h"
++#include "uana_xform.h"
++#include "uana_extract.h"
++#include "ulib_machine.h"
++#include "ulib_math.h"
++#include "ulib_std.h"
++#include "ulib_opsc.h"
++#include "ulib_regex.h"
++#include "chuck_io.h"
++
++#if defined(__PLATFORM_WIN32__)
++#include "dirent_win32.h"
++#endif
++//#if defined(__WINDOWS_PTHREAD__)
++#include <sys/stat.h>
++//#endif
++
++using namespace std;
++
++
++
++
++// function prototypes
++t_CKBOOL load_internal_modules( Chuck_Compiler * compiler );
++t_CKBOOL load_external_modules( Chuck_Compiler * compiler, 
++                                const char * extension, 
++                                std::list<std::string> & chugin_search_paths,
++                                std::list<std::string> & named_dls);
++t_CKBOOL load_module( Chuck_Env * env, f_ck_query query, const char * name, const char * nspc );
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: Chuck_Compiler()
++// desc: constructor
++//-----------------------------------------------------------------------------
++Chuck_Compiler::Chuck_Compiler()
++{
++    env = NULL;
++    emitter = NULL;
++    code = NULL;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: ~Chuck_Compiler()
++// desc: destructor
++//-----------------------------------------------------------------------------
++Chuck_Compiler::~Chuck_Compiler()
++{
++    // call shutdown
++    this->shutdown();
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: initialize()
++// desc: initialize the compiler
++//-----------------------------------------------------------------------------
++t_CKBOOL Chuck_Compiler::initialize( Chuck_VM * vm, 
++                                     std::list<std::string> & chugin_search_paths,
++                                     std::list<std::string> & named_dls )
++{
++    // log
++    EM_log( CK_LOG_SYSTEM, "initializing compiler..." );
++    // push indent level
++    EM_pushlog();
++
++    // allocate the type checker
++    env = type_engine_init( vm );
++    // add reference
++    env->add_ref();
++    
++    // allocate the emitter
++    emitter = emit_engine_init( env );
++    // add reference
++    emitter->add_ref();
++    // set auto depend to 0
++    m_auto_depend = FALSE;
++
++    // load internal libs
++    if( !load_internal_modules( this ) )
++        goto error;
++    
++    // load external libs
++    if( !load_external_modules( this, ".chug", chugin_search_paths, named_dls ) )
++        goto error;
++    
++    // pop indent
++    EM_poplog();
++
++    return TRUE;
++
++error:
++    // clean up
++    this->shutdown();
++
++    // pop indent
++    EM_poplog();
++
++    return FALSE;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: shutdown()
++// desc: shutdown the compiler
++//-----------------------------------------------------------------------------
++void Chuck_Compiler::shutdown()
++{
++    // log
++    EM_log( CK_LOG_SYSTEM, "shutting down compiler..." ) ;
++    // push indent
++    EM_pushlog();
++
++    // TODO: free
++    type_engine_shutdown( env );
++    // emit_engine_shutdown( emitter );
++    env = NULL;
++    emitter = NULL;
++    code = NULL;
++    m_auto_depend = FALSE;
++    m_recent.clear();
++    
++    for(std::list<Chuck_DLL *>::iterator i = m_dlls.begin();
++        i != m_dlls.end(); i++)
++    {
++        delete (*i);
++    }
++    
++    m_dlls.clear();
++
++    // pop indent
++    EM_poplog();
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: set_auto_depend()
++// desc: auto dependency resolve for types
++//-----------------------------------------------------------------------------
++void Chuck_Compiler::set_auto_depend( t_CKBOOL v )
++{
++    // log
++    EM_log( CK_LOG_SYSTEM, "type dependency resolution: %s",
++            v ? "AUTO" : "MANUAL" );
++    m_auto_depend = v;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: go()
++// desc: parse, type-check, and emit a program
++//-----------------------------------------------------------------------------
++t_CKBOOL Chuck_Compiler::go( const string & filename, FILE * fd, const char * str_src, const string & full_path )
++{
++    t_CKBOOL ret = TRUE;
++    Chuck_Context * context = NULL;
++
++    EM_reset_msg();
++    
++    // check to see if resolve dependencies automatically
++    if( !m_auto_depend )
++    {
++        // normal (note: full_path added 1.3.0.0)
++        ret = this->do_normal( filename, fd, str_src, full_path );
++        return ret;
++    }
++    else // auto
++    {
++        // parse the code
++        if( !chuck_parse( filename.c_str(), fd, str_src ) )
++            return FALSE;
++
++        // make the context
++        context = type_engine_make_context( g_program, filename );
++        if( !context ) return FALSE;
++
++        // reset the env
++        env->reset();
++
++        // load the context
++        if( !type_engine_load_context( env, context ) )
++            return FALSE;
++
++        // do entire file
++        if( !do_entire_file( context ) )
++        { ret = FALSE; goto cleanup; }
++
++        // get the code
++        if( !(code = context->code()) )
++        {
++            ret = FALSE;
++            EM_error2( 0, "internal error: context->code() NULL!" );
++            goto cleanup;
++        }
++
++cleanup:
++
++        // commit
++        if( ret ) env->global()->commit();
++        // or rollback
++        else env->global()->rollback();
++
++        // unload the context from the type-checker
++        if( !type_engine_unload_context( env ) )
++        {
++            EM_error2( 0, "internal error unloading context...\n" );
++            return FALSE;
++        }
++
++        return ret;
++    }
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: resolve()
++// desc: resolve type automatically - if auto_depend is off, return FALSE
++//-----------------------------------------------------------------------------
++t_CKBOOL Chuck_Compiler::resolve( const string & type )
++{
++    t_CKBOOL ret = TRUE;
++
++    // check auto_depend
++    if( !m_auto_depend )
++        return FALSE;
++
++    // look up if name is already parsed
++
++    
++
++    return ret;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: do_entire_file()
++// desc: parse, type-check, and emit a program
++//-----------------------------------------------------------------------------
++t_CKBOOL Chuck_Compiler::do_entire_file( Chuck_Context * context )
++{
++    // 0th-scan (pass 0)
++    if( !type_engine_scan0_prog( env, g_program, te_do_all ) )
++         return FALSE;
++
++    // 1st-scan (pass 1)
++    if( !type_engine_scan1_prog( env, g_program, te_do_all ) )
++        return FALSE;
++
++    // 2nd-scan (pass 2)
++    if( !type_engine_scan2_prog( env, g_program, te_do_all ) )
++        return FALSE;
++
++    // check the program (pass 3)
++    if( !type_engine_check_context( env, context, te_do_all ) )
++        return FALSE;
++
++    // emit (pass 4)
++    if( !emit_engine_emit_prog( emitter, g_program ) )
++        return FALSE;
++
++    // set the state of the context to done
++    context->progress = Chuck_Context::P_ALL;
++
++    return TRUE;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: do_only_classes()
++// desc: compile only classes definitions
++//-----------------------------------------------------------------------------
++t_CKBOOL Chuck_Compiler::do_only_classes( Chuck_Context * context )
++{
++    // 0th-scan (pass 0)
++    if( !type_engine_scan0_prog( env, g_program, te_do_classes_only ) )
++        return FALSE;
++
++    // 1st-scan (pass 1)
++    if( !type_engine_scan1_prog( env, g_program, te_do_classes_only ) )
++        return FALSE;
++
++    // 2nd-scan (pass 2)
++    if( !type_engine_scan2_prog( env, g_program, te_do_classes_only ) )
++        return FALSE;
++
++    // check the program (pass 3)
++    if( !type_engine_check_context( env, context, te_do_classes_only ) )
++        return FALSE;
++
++    // emit (pass 4)
++    if( !(code = emit_engine_emit_prog( emitter, g_program , te_do_classes_only )) )
++        return FALSE;
++
++    // set the state of the context to done
++    context->progress = Chuck_Context::P_ALL;
++
++    return TRUE;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: do_all_except_classes()
++// desc: compile everything except classes
++//-----------------------------------------------------------------------------
++t_CKBOOL Chuck_Compiler::do_all_except_classes( Chuck_Context * context )
++{
++    // 0th scan only deals with classes, so is not needed
++
++    // 1st-scan (pass 1)
++    if( !type_engine_scan1_prog( env, g_program, te_do_no_classes ) )
++        return FALSE;
++
++    // 2nd-scan (pass 2)
++    if( !type_engine_scan2_prog( env, g_program, te_do_no_classes ) )
++        return FALSE;
++
++    // check the program (pass 3)
++    if( !type_engine_check_context( env, context, te_do_no_classes ) )
++        return FALSE;
++
++    // emit (pass 4)
++    if( !(code = emit_engine_emit_prog( emitter, g_program, te_do_no_classes )) )
++        return FALSE;
++
++    // set the state of the context to done
++    context->progress = Chuck_Context::P_ALL;
++
++    return TRUE;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: do_normal()
++// desc: compile normally without auto-depend
++//-----------------------------------------------------------------------------
++t_CKBOOL Chuck_Compiler::do_normal( const string & filename, FILE * fd, const char * str_src, const string & full_path )
++{
++    t_CKBOOL ret = TRUE;
++    Chuck_Context * context = NULL;
++
++    // parse the code
++    if( !chuck_parse( filename.c_str(), fd, str_src ) )
++        return FALSE;
++
++    // make the context
++    context = type_engine_make_context( g_program, filename );
++    if( !context ) return FALSE;
++    
++    // remember full path (added 1.3.0.0)
++    context->full_path = full_path;
++
++    // reset the env
++    env->reset();
++
++    // load the context
++    if( !type_engine_load_context( env, context ) )
++        return FALSE;
++
++    // 0th-scan (pass 0)
++    if( !type_engine_scan0_prog( env, g_program, te_do_all ) )
++    { ret = FALSE; goto cleanup; }
++
++    // 1st-scan (pass 1)
++    if( !type_engine_scan1_prog( env, g_program, te_do_all ) )
++    { ret = FALSE; goto cleanup; }
++
++    // 2nd-scan (pass 2)
++    if( !type_engine_scan2_prog( env, g_program, te_do_all ) )
++    { ret = FALSE; goto cleanup; }
++
++    // check the program (pass 3)
++    if( !type_engine_check_context( env, context, te_do_all ) )
++    { ret = FALSE; goto cleanup; }
++
++    // emit (pass 4)
++    if( !(code = emit_engine_emit_prog( emitter, g_program, te_do_all )) )
++    { ret = FALSE; goto cleanup; }
++
++cleanup:
++
++    // commit
++    if( ret ) env->global()->commit();
++    // or rollback
++    else env->global()->rollback();
++
++    // unload the context from the type-checker
++    if( !type_engine_unload_context( env ) )
++    {
++        EM_error2( 0, "internal error unloading context...\n" );
++        return FALSE;
++    }
++
++    return ret;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: find_recent_path()
++// desc: find recent context by path
++//-----------------------------------------------------------------------------
++Chuck_Context * Chuck_Compiler::find_recent_path( const string & path )
++{
++    return NULL;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: find_recent_type()
++// desc: find recent context by type name
++//-----------------------------------------------------------------------------
++Chuck_Context * Chuck_Compiler::find_recent_type( const string & type )
++{
++    return NULL;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: add_recent_path()
++// desc: add recent context by path
++//-----------------------------------------------------------------------------
++t_CKBOOL Chuck_Compiler::add_recent_path( const string & path,
++                                          Chuck_Context * context )
++{
++    return TRUE;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: output()
++// desc: get the code generated by the last do()
++//-----------------------------------------------------------------------------
++Chuck_VM_Code * Chuck_Compiler::output()
++{
++    return this->code;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: load_module()
++// desc: load a dll and add it
++//-----------------------------------------------------------------------------
++t_CKBOOL load_module( Chuck_Env * env, f_ck_query query, 
++                      const char * name, const char * nspc )
++{
++    Chuck_DLL * dll = NULL;
++    t_CKBOOL query_failed = FALSE;
++    
++    // load osc
++    dll = new Chuck_DLL( name );
++    // (fixed: 1.3.0.0) query_failed now catches either failure of load or query
++    if( (query_failed = !(dll->load( query ) && dll->query())) ||
++        !type_engine_add_dll( env, dll, nspc ) )
++    {
++        fprintf( stderr, 
++                 "[chuck]: internal error loading module '%s.%s'...\n", 
++                 nspc, name );
++        if( query_failed )
++            fprintf( stderr, "       %s", dll->last_error() );
++
++        return FALSE;
++    }
++
++    return TRUE;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: load_internal_modules()
++// desc: ...
++//-----------------------------------------------------------------------------
++t_CKBOOL load_internal_modules( Chuck_Compiler * compiler )
++{
++    // log
++    EM_log( CK_LOG_SEVERE, "loading built-in modules..." );
++    // push indent level
++    EM_pushlog();
++    
++    // get env
++    Chuck_Env * env = compiler->env;
++    // make context
++    Chuck_Context * context = type_engine_make_context( NULL, "@[internal]" );
++    // reset env - not needed since we just created the env
++    env->reset();
++    // load it
++    type_engine_load_context( env, context );
++    
++//#ifndef __DISABLE_MIDI__
++    if( !init_class_Midi( env ) ) goto error;
++    if( !init_class_MidiRW( env ) ) goto error;
++//#endif // __DISABLE_MIDI__
++
++    // load
++    EM_log( CK_LOG_SEVERE, "module osc..." );
++    load_module( env, osc_query, "osc", "global" );
++    EM_log( CK_LOG_SEVERE, "module xxx..." );
++    load_module( env, xxx_query, "xxx", "global" );
++    EM_log( CK_LOG_SEVERE, "module filter..." );
++    load_module( env, filter_query, "filter", "global" );
++    EM_log( CK_LOG_SEVERE, "module STK..." );
++    load_module( env, stk_query, "stk", "global" );
++    EM_log( CK_LOG_SEVERE, "module xform..." );
++    load_module( env, xform_query, "xform", "global" );
++    EM_log( CK_LOG_SEVERE, "module extract..." );
++    load_module( env, extract_query, "extract", "global" );
++    
++    // load
++    EM_log( CK_LOG_SEVERE, "class 'machine'..." );
++    if( !load_module( env, machine_query, "Machine", "global" ) ) goto error;
++    machine_init( compiler, otf_process_msg );
++    EM_log( CK_LOG_SEVERE, "class 'std'..." );
++    if( !load_module( env, libstd_query, "Std", "global" ) ) goto error;
++    EM_log( CK_LOG_SEVERE, "class 'math'..." );
++    if( !load_module( env, libmath_query, "Math", "global" ) ) goto error;
++    EM_log( CK_LOG_SEVERE, "class 'opsc'..." );
++    if( !load_module( env, opensoundcontrol_query, "opsc", "global" ) ) goto error;
++    EM_log( CK_LOG_SEVERE, "class 'RegEx'..." );
++    if( !load_module( env, regex_query, "RegEx", "global" ) ) goto error;
++    // if( !load_module( env, net_query, "net", "global" ) ) goto error;
++    
++    if( !init_class_HID( env ) ) goto error;
++    if( !init_class_serialio( env ) ) goto error;
++        
++    // clear context
++    type_engine_unload_context( env );
++    
++    // commit what is in the type checker at this point
++    env->global()->commit();
++    
++    // pop indent level
++    EM_poplog();
++    
++    return TRUE;
++    
++error:
++    
++    // probably dangerous: rollback
++    env->global()->rollback();
++    
++    // clear context
++    type_engine_unload_context( env );
++    
++    // pop indent level
++    EM_poplog();
++    
++    return FALSE;
++}
++
++
++
++//-----------------------------------------------------------------------------
++// name: load_external_module_at_path()
++// desc: ...
++//-----------------------------------------------------------------------------
++t_CKBOOL load_external_module_at_path( Chuck_Compiler * compiler, 
++                                       const char * name,
++                                       const char * dl_path )
++{
++    Chuck_Env * env = compiler->env;
++    
++    EM_log(CK_LOG_SEVERE, "loading chugin '%s'", name);
++    
++    Chuck_DLL * dll = new Chuck_DLL(name);
++    t_CKBOOL query_failed = FALSE;
++    
++    if((query_failed = !(dll->load(dl_path) && dll->query())) ||
++       !type_engine_add_dll2(env, dll, "global"))
++    {
++        EM_log(CK_LOG_SEVERE, "error loading chugin '%s', skipping", name);
++        if(query_failed)
++            EM_log(CK_LOG_SEVERE, "error from chuck_dl: '%s'", dll->last_error());
++        delete dll;
++        
++        return FALSE;
++    }
++    else
++    {
++        compiler->m_dlls.push_back(dll);
++        return TRUE;
++    }        
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: extension_matches()
++// desc: ...
++//-----------------------------------------------------------------------------
++static t_CKBOOL extension_matches( const char * filename, const char * extension )
++{
++    t_CKUINT extension_length = strlen(extension);
++    t_CKUINT filename_length = strlen(filename);
++    
++    return strncmp( extension, filename+(filename_length-extension_length), 
++                    extension_length) == 0;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: load_external_modules_in_directory()
++// desc: ...
++//-----------------------------------------------------------------------------
++t_CKBOOL load_external_modules_in_directory( Chuck_Compiler * compiler,
++                                             const char * directory,
++                                             const char * extension )
++{
++    static const t_CKBOOL RECURSIVE_SEARCH = false;
++    
++    DIR * dir = opendir(directory);
++    
++    if( dir )
++    {
++        // log
++        EM_log( CK_LOG_INFO, "examining directory '%s' for chugins", directory );
++        
++        struct dirent *de = NULL;
++        
++        while( (de = readdir(dir)) )
++        {
++            t_CKBOOL is_regular = false;
++            t_CKBOOL is_directory = false;
++            
++#if defined(__PLATFORM_WIN32__)
++            is_directory = de->data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
++            is_regular = ((de->data.dwFileAttributes & FILE_ATTRIBUTE_NORMAL) || 
++                          (de->data.dwFileAttributes & FILE_ATTRIBUTE_READONLY) ||
++                          (de->data.dwFileAttributes & FILE_ATTRIBUTE_ARCHIVE));
++#elif defined(__WINDOWS_PTHREAD__) // Cygwin -- doesn't have dirent d_type
++            std::string absolute_path = std::string(directory) + "/" + de->d_name;
++            struct stat st;
++            if( stat(absolute_path.c_str(), &st) == 0 )
++            {
++                is_directory = st.st_mode & S_IFDIR;
++                is_regular = st.st_mode & S_IFREG;
++            }
++            else
++            {
++                // uhh ... 
++                EM_log( CK_LOG_INFO, 
++                        "unable to stat file '%s', ignoring for chugins", 
++                        absolute_path.c_str() );
++                continue;
++            }
++#else
++            is_directory = de->d_type == DT_DIR;
++            is_regular = de->d_type == DT_REG;
++#endif
++            
++            if( is_regular ) // TODO: follow links?
++            {
++                if( extension_matches(de->d_name, extension) )
++                {
++                    std::string absolute_path = std::string(directory) + "/" + de->d_name;
++                    
++                    load_external_module_at_path(compiler, de->d_name, 
++                                                 absolute_path.c_str());
++                }
++                else if( extension_matches(de->d_name, ".ck") )
++                {
++                    std::string absolute_path = std::string(directory) + "/" + de->d_name;
++                    compiler->m_cklibs_to_preload.push_back(absolute_path);
++                }
++            }
++            else if( RECURSIVE_SEARCH && is_directory )
++            {
++                // recurse
++                // TODO: max depth?
++                if( strncmp(de->d_name, ".", sizeof(".") != 0) &&
++                    strncmp(de->d_name, "..", sizeof("..")) != 0 )
++                {
++                    std::string absolute_path = std::string(directory) + "/" + de->d_name;
++                    load_external_modules_in_directory(compiler, 
++                                                       absolute_path.c_str(),
++                                                       extension);
++                }
++            }
++        }
++        
++        // close
++        closedir( dir );
++    }
++    else
++    {
++        // log (1.3.1.2: changed to 2 lines to stay within 80 chars)
++        EM_log( CK_LOG_INFO, "unable to open directory '%s'...", directory );
++        EM_log( CK_LOG_INFO, "(ignoring for chugins...)" );
++    }
++    
++    return TRUE;
++}
++
++
++
++
++//-----------------------------------------------------------------------------
++// name: load_external_modules()
++// desc: ...
++//-----------------------------------------------------------------------------
++t_CKBOOL load_external_modules( Chuck_Compiler * compiler, 
++                                const char * extension, 
++                                std::list<std::string> & chugin_search_paths,
++                                std::list<std::string> & named_dls )
++{
++    // log
++    EM_log( CK_LOG_SEVERE, "loading chugins" );
++    // push indent level
++    EM_pushlog();
++    
++    // get env
++    Chuck_Env * env = compiler->env;
++    // make context
++    Chuck_Context * context = type_engine_make_context( NULL, "@[external]" );
++    // reset env - not needed since we just created the env
++    env->reset();
++    // load it
++    type_engine_load_context( env, context );
++    
++    /* first load dynamic libraries explicitly named on the command line */
++    
++    for(std::list<std::string>::iterator i_dl = named_dls.begin();
++        i_dl != named_dls.end(); i_dl++)
++    {
++        std::string & dl_path = *i_dl;
++        if(!extension_matches(dl_path.c_str(), extension))
++            dl_path += extension;
++        
++        load_external_module_at_path(compiler, dl_path.c_str(),
++                                     dl_path.c_str());
++    }
++    
++    /* now recurse through search paths and load any DLs or .ck files found */
++    
++    for(std::list<std::string>::iterator i_sp = chugin_search_paths.begin();
++        i_sp != chugin_search_paths.end(); i_sp++)
++    {
++        load_external_modules_in_directory(compiler, (*i_sp).c_str(), extension);
++    }    
++        
++    // clear context
++    type_engine_unload_context( env );
++    
++    // commit what is in the type checker at this point
++    env->global()->commit();
++    
++    // pop indent level
++    EM_poplog();
++    
++    return TRUE;
++   /* 
++error:
++    
++    // probably dangerous: rollback
++    env->global()->rollback();
++    
++    // clear context
++    type_engine_unload_context( env );
++    
++    // pop indent level
++    EM_poplog();
++    
++    return FALSE;
++	*/
++}
++
+diff -rupN OLD/src/.gitignore chuck-1.3.4.0/src/.gitignore
+--- OLD/src/.gitignore	1969-12-31 19:00:00.000000000 -0500
++++ chuck-1.3.4.0/src/.gitignore	2014-10-08 19:22:11.803571384 -0400
+@@ -0,0 +1 @@
++*.o
+diff -rupN OLD/src/makefile chuck-1.3.4.0/src/makefile
+--- OLD/src/makefile	2014-10-09 10:04:50.199118796 -0400
++++ chuck-1.3.4.0/src/makefile	2014-10-08 19:30:25.706020517 -0400
+@@ -75,6 +75,8 @@ ifneq (,$(strip $(filter osx-rl,$(MAKECM
+ include makefile.rl
+ endif
+ 
++include blackbox/makefile
++
+ CSRCS+= chuck.tab.c chuck.yy.c util_math.c util_network.c util_raw.c \
+ 	util_xforms.c
+ CXXSRCS+= chuck_absyn.cpp chuck_parse.cpp chuck_errmsg.cpp \
+@@ -88,7 +90,7 @@ CXXSRCS+= chuck_absyn.cpp chuck_parse.cp
+ 	ugen_stk.cpp ugen_xxx.cpp ulib_machine.cpp ulib_math.cpp ulib_std.cpp \
+ 	ulib_opsc.cpp ulib_regex.cpp util_buffers.cpp util_console.cpp \
+ 	util_string.cpp util_thread.cpp util_opsc.cpp util_serial.cpp \
+-	util_hid.cpp uana_xform.cpp uana_extract.cpp
++	util_hid.cpp uana_xform.cpp uana_extract.cpp 
+ LO_CSRCS+= lo/address.c lo/blob.c lo/bundle.c lo/message.c lo/method.c \
+     lo/pattern_match.c lo/send.c lo/server.c lo/server_thread.c lo/timetag.c
+ 
+diff -rupN OLD/src/makefile.jack chuck-1.3.4.0/src/makefile.jack
+--- OLD/src/makefile.jack	2014-10-09 10:04:50.223118898 -0400
++++ chuck-1.3.4.0/src/makefile.jack	2014-10-04 16:50:57.665597394 -0400
+@@ -2,3 +2,5 @@
+ CFLAGS+= -D__UNIX_JACK__ -D__PLATFORM_LINUX__ -O3 -fno-strict-aliasing -D__CK_SNDFILE_NATIVE__
+ LDFLAGS+= -lasound -ljack -lstdc++ -ldl -lm -lsndfile -lpthread
+ 
++#ugen_clip.o: ugen_clip.h ugen_clip.cpp
++#	$(CXX) $(FLAGS) ugen_clip.cpp
+diff -rupN OLD/src/makefile.orig chuck-1.3.4.0/src/makefile.orig
+--- OLD/src/makefile.orig	1969-12-31 19:00:00.000000000 -0500
++++ chuck-1.3.4.0/src/makefile.orig	2014-04-07 05:34:22.000000000 -0400
+@@ -0,0 +1,222 @@
++DESTDIR=/usr/bin
++
++# default target: print usage message and quit
++current: 
++	@echo "[chuck build]: please use one of the following configurations:"
++	@echo "   make linux-alsa, make linux-jack, make linux-pulse,"
++	@echo "   make osx, make osx-ub, make cygwin, or make win32"
++
++install:
++	cp $(wildcard chuck chuck.exe) $(DESTDIR)/
++	chmod 755 $(DESTDIR)/$(wildcard chuck chuck.exe)
++
++ifneq ($(CK_TARGET),)
++.DEFAULT_GOAL:=$(CK_TARGET)
++ifeq ($(MAKECMDGOALS),)
++MAKECMDGOALS:=$(.DEFAULT_GOAL)
++endif
++endif
++
++.PHONY: osx linux-pulse linux-jack linux-alsa cygwin osx-rl
++osx linux-pulse linux-jack linux-alsa cygwin osx-rl: chuck
++
++win32:
++	make -f makefile.win32
++
++CK_VERSION=1.3.4.0
++
++LEX=flex
++YACC=bison
++CC=gcc
++CXX=g++
++LD=g++
++
++CFLAGS+=-I. -Ilo
++
++ifneq ($(CHUCK_STAT),)
++CFLAGS+= -D__CHUCK_STAT_TRACK__
++endif
++
++ifneq ($(CHUCK_DEBUG),)
++CFLAGS+= -g
++else
++CFLAGS+= -O3
++endif
++
++ifneq ($(USE_64_BIT_SAMPLE),)
++CFLAGS+= -D__CHUCK_USE_64_BIT_SAMPLE__
++endif
++
++ifneq ($(CHUCK_STRICT),)
++CFLAGS+= -Wall
++endif
++
++ifneq (,$(strip $(filter osx bin-dist-osx,$(MAKECMDGOALS))))
++include makefile.osx
++endif
++
++ifneq (,$(strip $(filter linux-pulse,$(MAKECMDGOALS))))
++include makefile.pulse
++endif
++
++ifneq (,$(strip $(filter linux-jack,$(MAKECMDGOALS))))
++include makefile.jack
++endif
++
++ifneq (,$(strip $(filter linux-alsa,$(MAKECMDGOALS))))
++include makefile.alsa
++endif
++
++ifneq (,$(strip $(filter cygwin,$(MAKECMDGOALS))))
++include makefile.cygwin
++endif
++
++ifneq (,$(strip $(filter osx-rl,$(MAKECMDGOALS))))
++include makefile.rl
++endif
++
++CSRCS+= chuck.tab.c chuck.yy.c util_math.c util_network.c util_raw.c \
++	util_xforms.c
++CXXSRCS+= chuck_absyn.cpp chuck_parse.cpp chuck_errmsg.cpp \
++	chuck_frame.cpp chuck_symbol.cpp chuck_table.cpp chuck_utils.cpp \
++	chuck_vm.cpp chuck_instr.cpp chuck_scan.cpp chuck_type.cpp chuck_emit.cpp \
++	chuck_compile.cpp chuck_dl.cpp chuck_oo.cpp chuck_lang.cpp chuck_ugen.cpp \
++	chuck_main.cpp chuck_otf.cpp chuck_stats.cpp chuck_bbq.cpp chuck_shell.cpp \
++	chuck_console.cpp chuck_globals.cpp chuck_io.cpp \
++    digiio_rtaudio.cpp hidio_sdl.cpp \
++	midiio_rtmidi.cpp RtAudio/RtAudio.cpp rtmidi.cpp ugen_osc.cpp ugen_filter.cpp \
++	ugen_stk.cpp ugen_xxx.cpp ulib_machine.cpp ulib_math.cpp ulib_std.cpp \
++	ulib_opsc.cpp ulib_regex.cpp util_buffers.cpp util_console.cpp \
++	util_string.cpp util_thread.cpp util_opsc.cpp util_serial.cpp \
++	util_hid.cpp uana_xform.cpp uana_extract.cpp
++LO_CSRCS+= lo/address.c lo/blob.c lo/bundle.c lo/message.c lo/method.c \
++    lo/pattern_match.c lo/send.c lo/server.c lo/server_thread.c lo/timetag.c
++
++COBJS=$(CSRCS:.c=.o)
++CXXOBJS=$(CXXSRCS:.cpp=.o)
++LO_COBJS=$(LO_CSRCS:.c=.o)
++OBJS=$(COBJS) $(CXXOBJS) $(LO_COBJS)
++
++LO_CFLAGS=-DHAVE_CONFIG_H -I.
++
++# remove -arch options
++CFLAGSDEPEND=$(CFLAGS)
++
++ifneq (,$(ARCHS))
++ARCHOPTS=$(addprefix -arch ,$(ARCHS))
++else
++ARCHOPTS=
++endif
++
++NOTES=AUTHORS DEVELOPER PROGRAMMER README TODO COPYING INSTALL QUICKSTART \
++ THANKS VERSIONS
++BIN_NOTES=README.txt
++DOC_NOTES=GOTO
++DIST_DIR=chuck-$(CK_VERSION)
++DIST_DIR_EXE=chuck-$(CK_VERSION)-exe
++CK_SVN=https://chuck-dev.stanford.edu/svn/chuck/
++
++# pull in dependency info for *existing* .o files
++-include $(OBJS:.o=.d)
++
++chuck: $(OBJS)
++	$(LD) -o chuck $(OBJS) $(LDFLAGS) $(ARCHOPTS)
++
++chuck.tab.c chuck.tab.h: chuck.y
++	$(YACC) -dv -b chuck chuck.y
++
++chuck.yy.c: chuck.lex
++	$(LEX) -ochuck.yy.c chuck.lex
++
++chuck_win32.c: chuck.yy.c
++	$(LEX) --nounistd -ochuck.yy.c chuck.lex
++	cat chuck.tab.c chuck.yy.c > $@
++
++chuck_win32.h: chuck.tab.h
++	cat chuck.tab.h > $@
++
++$(COBJS): %.o: %.c
++	$(CC) $(CFLAGS) $(ARCHOPTS) -c $< -o $@
++	@$(CC) -MM -MQ "$@" $(CFLAGSDEPEND) $< > $*.d
++
++$(LO_COBJS): %.o: %.c
++	$(CC) $(CFLAGS) $(LO_CFLAGS) $(ARCHOPTS) -c $< -o $@
++	@$(CC) -MM -MQ "$@" $(CFLAGSDEPEND) $(LO_CFLAGS) $< > $*.d
++
++$(CXXOBJS): %.o: %.cpp
++	$(CXX) $(CFLAGS) $(ARCHOPTS) -c $< -o $@
++	@$(CXX) -MM -MQ "$@" $(CFLAGSDEPEND) $< > $*.d
++
++clean: 
++	@rm -rf $(wildcard chuck chuck.exe) *.o *.d $(OBJS) \
++         $(patsubst %.o,%.d,$(OBJS)) *~ chuck.output chuck.tab.h chuck.tab.c \
++         chuck.yy.c $(DIST_DIR){,.tgz,.zip} Release Debug
++	
++
++# ------------------------------------------------------------------------------
++# Distribution meta-targets
++# ------------------------------------------------------------------------------
++
++.PHONY: bin-dist-osx
++bin-dist-osx: osx
++# clean out old dists
++	-rm -rf $(DIST_DIR_EXE){,.tgz,.zip}
++# create directories
++	mkdir $(DIST_DIR_EXE) $(DIST_DIR_EXE)/bin $(DIST_DIR_EXE)/doc
++# copy binary + notes
++	cp chuck $(addprefix ../notes/bin/,$(BIN_NOTES)) $(DIST_DIR_EXE)/bin
++# copy manual + notes
++	cp ../doc/manual/ChucK_manual.pdf $(addprefix ../notes/doc/,$(DOC_NOTES)) $(DIST_DIR_EXE)/doc
++# copy examples
++	svn export $(CK_SVN)/trunk/src/examples $(DIST_DIR_EXE)/examples &> /dev/null
++#cp -r examples $(DIST_DIR_EXE)/examples
++# remove .svn directories
++#-find $(DIST_DIR_EXE)/examples/ -name '.svn' -exec rm -rf '{}' \; &> /dev/null
++# copy notes
++	cp $(addprefix ../notes/,$(NOTES)) $(DIST_DIR_EXE)
++# tar/gzip
++	tar czf $(DIST_DIR_EXE).tgz $(DIST_DIR_EXE)
++
++.PHONY: bin-dist-win32
++bin-dist-win32:
++#	make win32
++# clean out old dists
++	-rm -rf $(DIST_DIR_EXE){,.tgz,.zip}
++# create directories
++	mkdir $(DIST_DIR_EXE) $(DIST_DIR_EXE)/bin $(DIST_DIR_EXE)/doc
++# copy binary + notes
++	cp Release/chuck.exe $(addprefix ../notes/bin/,$(BIN_NOTES)) $(DIST_DIR_EXE)/bin
++# copy manual + notes
++	cp ../doc/manual/ChucK_manual.pdf $(addprefix ../notes/doc/,$(DOC_NOTES)) $(DIST_DIR_EXE)/doc
++# copy examples
++	svn export $(CK_SVN)/trunk/src/examples $(DIST_DIR_EXE)/examples &> /dev/null
++#cp -r examples $(DIST_DIR_EXE)/examples
++# remove .svn directories
++#-find $(DIST_DIR_EXE)/examples/ -name '.svn' -exec rm -rf '{}' \; &> /dev/null
++# copy notes
++	cp $(addprefix ../notes/,$(NOTES)) $(DIST_DIR_EXE)
++# tar/gzip
++	zip -q -9 -r -m $(DIST_DIR_EXE).zip $(DIST_DIR_EXE)
++
++.PHONY: src-dist
++src-dist:
++# clean out old dists
++	rm -rf $(DIST_DIR) $(DIST_DIR){.tgz,.zip}
++# create directories
++	mkdir $(DIST_DIR) $(DIST_DIR)/doc
++# copy src
++	svn export $(CK_SVN)/trunk/src $(DIST_DIR)/src 2>&1 > /dev/null
++	rm -rf $(DIST_DIR)/src/{examples,test}
++# copy manual + notes
++	cp ../doc/manual/ChucK_manual.pdf $(addprefix ../notes/doc/,$(DOC_NOTES)) $(DIST_DIR)/doc
++# copy examples
++	svn export $(CK_SVN)/trunk/src/examples $(DIST_DIR)/examples 2>&1 > /dev/null
++#cp -r examples $(DIST_DIR)/examples
++# remove .svn directories
++#-find $(DIST_DIR)/examples/ -name '.svn' -exec rm -rf '{}' \; &> /dev/null
++# copy notes
++	cp $(addprefix ../notes/,$(NOTES)) $(DIST_DIR)
++# tar/gzip
++	tar czf $(DIST_DIR).tgz $(DIST_DIR)
++
++
+diff -rupN OLD/src/out.txt chuck-1.3.4.0/src/out.txt
+--- OLD/src/out.txt	1969-12-31 19:00:00.000000000 -0500
++++ chuck-1.3.4.0/src/out.txt	2014-10-08 19:16:27.297863070 -0400
+@@ -0,0 +1,202 @@
++momu/mo_audio.h:    static bool init( Float64 srate, UInt32 frameSize, UInt32 numChannels );
++momu/mo_audio.h:    static Float64 getSampleRate() { return m_srate; }
++momu/mo_audio.h:    static Float64 m_srate;
++momu/mo_audio.mm:Float64 MoAudio::m_srate = 44100.0;
++momu/mo_audio.mm:bool MoAudio::init( Float64 srate, UInt32 frameSize, UInt32 numChannels )
++momu/mo_audio.mm:    m_info->m_dataFormat.mSampleRate = srate;
++momu/mo_audio.mm:    m_srate = srate;
++momu/mo_audio.mm:    Float32 preferredBufferSize = (Float32)(frameSize / srate); // .020;
++momu/mo_audio.mm:    Float64 preferredSampleRate = srate;
++digiio_rtaudio.cpp:                              BOOL__ force_srate )
++digiio_rtaudio.cpp:                if( force_srate )
++chuck_dl.cpp:    srate = Digitalio::sampling_rate() ; bufsize = Digitalio::buffer_size();
++chuck_dl.cpp:    srate = 0; bufsize = 0;
++chuck_dl.cpp:static t_CKUINT ck_get_srate()
++chuck_dl.cpp:    return g_vm->srate();
++chuck_dl.cpp:get_srate(ck_get_srate)
++util_sndfile.c:	int		srate ;		/* sample frequency in hertz */
++util_sndfile.c:	psf_binheader_readf (psf, "E4444", &hdr.srate, &hdr.frames, &hdr.lbeg, &hdr.lend) ;
++util_sndfile.c:	psf->sf.samplerate = hdr.srate ;
++util_sndfile.c:	unsigned short srate, maxval ;
++util_sndfile.c:	psf_binheader_readf (psf, "e211", &dwdh.srate, &dwdh.channels, &dwdh.bitwidth) ;
++util_sndfile.c:						 dwdh.srate, dwdh.channels, dwdh.bitwidth) ;
++util_sndfile.c:	psf->sf.samplerate = dwdh.srate ;
++util_sndfile.c:	float	srate ;
++util_sndfile.c:		if (sscanf ((char*) psf->buffer, "%f", &srate) == 1)
++util_sndfile.c:			psf->sf.samplerate = srate ;
++util_sndfile.c:{	unsigned char	format, srate, sr2, sr3 ;
++util_sndfile.c:	psf_binheader_readf (psf, "j11", 6, &txwh.format, &txwh.srate) ;
++util_sndfile.c:	switch (txwh.srate)
++util_sndfile.c:		psf_log_printf (psf, " Sample Rate : %d (0x%X) => %d\n", txwh.srate, txwh.srhash, psf->sf.samplerate) ;
++util_sndfile.c:		psf_log_printf (psf, " Sample Rate : %d => %d\n", txwh.srate, psf->sf.samplerate) ;
++util_sndfile.c:		{	blockalign = wav_w64_srate2blocksize (psf->sf.samplerate * psf->sf.channels) ;
++util_sndfile.c:						blockalign		= wav_w64_srate2blocksize (psf->sf.samplerate * psf->sf.channels) ;
++util_sndfile.c:						blockalign		= wav_w64_srate2blocksize (psf->sf.samplerate * psf->sf.channels) ;
++util_sndfile.c:		{	blockalign = wav_w64_srate2blocksize (psf->sf.samplerate * psf->sf.channels) ;
++util_sndfile.c:						blockalign		= wav_w64_srate2blocksize (psf->sf.samplerate * psf->sf.channels) ;
++util_sndfile.c:						blockalign		= wav_w64_srate2blocksize (psf->sf.samplerate * psf->sf.channels) ;
++util_sndfile.c:wav_w64_srate2blocksize (int srate_chan_product)
++util_sndfile.c:{	if (srate_chan_product < 12000)
++util_sndfile.c:	if (srate_chan_product < 23000)
++util_sndfile.c:	if (srate_chan_product < 44000)
++util_sndfile.c:} /* srate2blocksize */
++chuck_vm.h:    t_CKUINT srate;
++chuck_vm.h:                         t_CKUINT srate = 44100,
++chuck_vm.h:                         // force_srate added 1.3.1.2
++chuck_vm.h:                         t_CKBOOL force_srate = FALSE );
++chuck_vm.h:    t_CKUINT srate() const;
++Binary file chuck_vm.o matches
++Binary file chuck_dl.o matches
++Binary file chuck matches
++Binary file ugen_stk.o matches
++chuck_type.cpp:    t_CKDUR second = vm->srate() * samp;
++chuck_bbq.cpp:                        void * callback, void * data, t_CKBOOL force_srate )
++chuck_bbq.cpp:        force_srate
++chuck_bbq.cpp:// name: set_srate()
++chuck_bbq.cpp:void BBQ::set_srate( DWORD__ srate )
++chuck_bbq.cpp:    Digitalio::m_sampling_rate = srate;
++Binary file ugen_osc.o matches
++Binary file chuck_type.o matches
++Binary file ugen_xxx.o matches
++ugen_osc.cpp:static t_CKUINT g_srate = 0;
++ugen_osc.cpp:    // srate
++ugen_osc.cpp:    g_srate = QUERY->srate;
++ugen_osc.cpp:    t_CKUINT srate;
++ugen_osc.cpp:        srate = g_srate;
++ugen_osc.cpp:            d->num = d->freq / d->srate;
++ugen_osc.cpp:            d->num = freq / d->srate;
++ugen_osc.cpp:            d->num = d->freq / d->srate;
++ugen_osc.cpp:            d->num = freq / d->srate;
++ugen_osc.cpp:            d->num = d->freq / d->srate;
++ugen_osc.cpp:            d->num = freq / d->srate;
++ugen_osc.cpp:            d->num = d->freq / d->srate;
++ugen_osc.cpp:            d->num = freq / d->srate;
++ugen_osc.cpp:    d->num = d->freq / d->srate;
++ugen_osc.cpp:    else d->freq = 1 / (period / d->srate);
++ugen_osc.cpp:    d->num = d->freq / d->srate;
++ugen_osc.cpp:    if( d->freq != 0.0 ) period = 1 / d->freq * d->srate;
++ugen_osc.cpp:    // srate
++ugen_osc.cpp:    g_srate = QUERY->srate;
++ugen_osc.cpp:    t_CKUINT srate;
++ugen_osc.cpp:        srate       = g_srate;
++chuck_dl.h:    t_CKUINT srate;
++chuck_dl.h:        t_CKUINT (* const get_srate)();
++util_sndfile.h:int     wav_w64_srate2blocksize (int srate_chan_product) ;
++Binary file chuck_main.o matches
++ugen_xxx.cpp:t_CKUINT g_srate;
++ugen_xxx.cpp:    g_srate = QUERY->srate;
++ugen_xxx.cpp:        bufsize  = 2 * g_srate;
++ugen_xxx.cpp:        t_CKUINT srate = 22050;
++ugen_xxx.cpp:            rawsize = glot_ahh_size; rawdata = glot_ahh_data; srate = 44100;
++ugen_xxx.cpp:            rawsize = glot_eee_size; rawdata = glot_eee_data; srate = 44100;
++ugen_xxx.cpp:            rawsize = glot_ooo_size; rawdata = glot_ooo_data; srate = 44100;
++ugen_xxx.cpp:            rawsize = glot_pop_size; rawdata = glot_pop_data; srate = 44100;
++ugen_xxx.cpp:        d->samplerate = srate;
++ugen_xxx.cpp:        EM_log( CK_LOG_INFO, "srate: %d", d->samplerate );
++ugen_xxx.cpp:    d->sampleratio = (double)d->samplerate / (double)g_srate;
++ugen_xxx.cpp:    d->rate = ( freq * (double) d->num_frames / (double) g_srate );
++ugen_xxx.cpp:    RETURN->v_float = d->rate * (t_CKFLOAT) g_srate / ( (t_CKFLOAT) d->num_frames ); // TODO: really?
++ugen_xxx.cpp:    RETURN->v_float = d->rate * (t_CKFLOAT) g_srate / ( (t_CKFLOAT) d->num_frames ); 
++ugen_xxx.cpp:const t_CKDUR Dyno_Data::ms = g_vm->srate() * 1.0 / 1000.0;
++chuck_main.cpp:    fprintf( stderr, "               srate:<N>|bufsize:<N>|bufnum:<N>|shell|empty|\n" );
++chuck_main.cpp:    t_CKUINT srate = SAMPLING_RATE_DEFAULT;
++chuck_main.cpp:    t_CKBOOL force_srate = FALSE; // added 1.3.1.2
++chuck_main.cpp:            else if( !strncmp(argv[i], "--srate:", 8) ) // (added 1.3.0.0)
++chuck_main.cpp:            {   srate = atoi( argv[i]+8 ) > 0 ? atoi( argv[i]+8 ) : srate; force_srate = TRUE; }
++chuck_main.cpp:            else if( !strncmp(argv[i], "--srate", 7) )
++chuck_main.cpp:            {   srate = atoi( argv[i]+7 ) > 0 ? atoi( argv[i]+7 ) : srate; force_srate = TRUE; }
++chuck_main.cpp:            {   srate = atoi( argv[i]+2 ) > 0 ? atoi( argv[i]+2 ) : srate; force_srate = TRUE; }
++chuck_main.cpp:    if( !vm->initialize( enable_audio, vm_halt, srate, buffer_size,
++chuck_main.cpp:                         block, adaptive_size, force_srate ) )
++chuck_bbq.h:                       // force_srate added 1.3.1.2
++chuck_bbq.h:                       BOOL__ force_srate = FALSE );
++chuck_bbq.h:    void set_srate( DWORD__ srate );
++Binary file ugen_filter.o matches
++Binary file chuck_bbq.o matches
++blackbox/ugen_reverbsc.cpp:static t_CKUINT g_srate = 0;
++blackbox/ugen_reverbsc.cpp:	p->iSampleRate = g_srate;
++blackbox/ugen_reverbsc.cpp:	p->sampleRate = g_srate;
++blackbox/ugen_reverbsc.cpp:	g_srate = QUERY->srate;
++Binary file blackbox/.ugen_reverbsc.cpp.swp matches
++Binary file blackbox/ugen_reverbsc.o matches
++ugen_filter.cpp:static t_CKUINT g_srate = 0;
++ugen_filter.cpp:    // set srate
++ugen_filter.cpp:    g_srate = QUERY->srate;
++ugen_filter.cpp:    g_radians_per_sample = TWO_PI / (t_CKFLOAT)g_srate;
++ugen_filter.cpp:    t_CKUINT srate;
++ugen_filter.cpp:        srate = g_srate;
++ugen_filter.cpp:    d->m_a1 = (SAMPLE)(-2.0 * d->prad * cos(2.0 * ONE_PI * d->pfreq / (double)d->srate));
++ugen_filter.cpp:    d->m_b1 = (SAMPLE)(-2.0 * d->zrad * cos(2.0 * ONE_PI * d->zfreq / (double)d->srate));
++ugen_filter.cpp:        double real = 1.0 - d->prad + (d->m_a2 - d->prad) * cos( 2.0 * ONE_PI * d->pfreq / d->srate );
++ugen_filter.cpp:        double imag = (d->m_a2 - d->prad) * sin( 2.0 * ONE_PI * d->pfreq / d->srate );
++ugen_filter.cpp:        double real = 1.0 - d->prad + (d->m_a2 - d->prad) * cos( 2.0 * ONE_PI * d->pfreq / d->srate );
++ugen_filter.cpp:        double imag = (d->m_a2 - d->prad) * sin( 2.0 * ONE_PI * d->pfreq / d->srate );
++ugen_filter.cpp:        double real = 1.0 - d->prad + (d->m_a2 - d->prad) * cos( 2.0 * ONE_PI * d->pfreq / d->srate );
++ugen_filter.cpp:        double imag = (d->m_a2 - d->prad) * sin( 2.0 * ONE_PI * d->pfreq / d->srate );
++digiio_rtaudio.h:                              // force_srate added 1.3.1.2
++digiio_rtaudio.h:                              BOOL__ force_srate );
++ugen_stk.h:  static MY_FLOAT srate;
++Binary file chuck_lang.o matches
++chuck_vm.cpp:t_CKBOOL Chuck_VM::initialize( t_CKBOOL enable_audio, t_CKBOOL halt, t_CKUINT srate,
++chuck_vm.cpp:                               t_CKBOOL force_srate )
++chuck_vm.cpp:    m_bbq->set_srate( srate );
++chuck_vm.cpp:        m_block, this, m_audio, NULL, NULL, force_srate ) )
++chuck_vm.cpp:    srate = Digitalio::sampling_rate();
++chuck_vm.cpp:    EM_log( CK_LOG_SYSTEM, "sample rate: %ld", srate );
++chuck_vm.cpp:        float srate = (float)Digitalio::sampling_rate();
++chuck_vm.cpp:        fprintf( stderr, "      = %.6f (second)\n", m_shreduler->now_system / srate );
++chuck_vm.cpp:        fprintf( stderr, "      = %.6f (minute)\n", m_shreduler->now_system / srate / 60.0f );
++chuck_vm.cpp:        fprintf( stderr, "      = %.6f (hour)\n", m_shreduler->now_system / srate / 60.0f / 60.0f );
++chuck_vm.cpp:        fprintf( stderr, "      = %.6f (day)\n", m_shreduler->now_system / srate / 60.0f / 60.0f / 24.0f );
++chuck_vm.cpp:        fprintf( stderr, "      = %.6f (week)\n", m_shreduler->now_system / srate / 60.0f / 60.0f / 24.0f / 7.0f );
++chuck_vm.cpp:// name: srate()
++chuck_vm.cpp:t_CKUINT Chuck_VM::srate() const
++chuck_vm.cpp:    t_CKUINT srate = Digitalio::sampling_rate();
++chuck_vm.cpp:    t_CKUINT h = s/(srate*3600);
++chuck_vm.cpp:    s = s - (h*(srate*3600));
++chuck_vm.cpp:    t_CKUINT m = s / (srate*60);
++chuck_vm.cpp:    s = s - (m*(srate*60));
++chuck_vm.cpp:    t_CKUINT sec = s / srate;
++chuck_vm.cpp:    s = s - (sec*(srate));
++chuck_vm.cpp:    // float millisecond = s / (float)(srate) * 1000.0f;
++chuck_vm.cpp:    status->srate = srate;
++chuck_vm.cpp:            (m_status.now_system - shred->start) / m_status.srate,
++chuck_vm.cpp:    srate = 0;
++RtAudio/RtAudio.cpp:  int srate = sampleRate;
++RtAudio/RtAudio.cpp:  result = ioctl( fd, SNDCTL_DSP_SPEED, &srate );
++RtAudio/RtAudio.cpp:  if ( abs( srate - sampleRate ) > 100 ) {
++RtAudio/original/RtAudio.cpp:  int srate = sampleRate;
++RtAudio/original/RtAudio.cpp:  result = ioctl( fd, SNDCTL_DSP_SPEED, &srate );
++RtAudio/original/RtAudio.cpp:  if ( abs( srate - sampleRate ) > 100 ) {
++ugen_stk.cpp:// static t_CKUINT g_srate = 0;
++ugen_stk.cpp:    // set srate
++ugen_stk.cpp:    Stk::setSampleRate( QUERY->srate );
++ugen_stk.cpp:MY_FLOAT Stk :: srate = (MY_FLOAT) SRATE;
++ugen_stk.cpp:  return srate;
++ugen_stk.cpp:    srate = newRate;
++ugen_stk.cpp:  SINT32 srate;
++ugen_stk.cpp:  if ( fread(&srate, 4, 1, fd) != 1 ) goto error;
++ugen_stk.cpp:  swap32((unsigned char *)&srate);
++ugen_stk.cpp:  fileRate = (MY_FLOAT) srate;
++ugen_stk.cpp:  rate = (MY_FLOAT) ( srate / Stk::sampleRate() );
++ugen_stk.cpp:  SINT32 srate;
++ugen_stk.cpp:  if ( fread(&srate, 4, 1, fd) != 1 ) goto error;
++ugen_stk.cpp:  swap32((unsigned char *)&srate);
++ugen_stk.cpp:  fileRate = (MY_FLOAT) srate;
++ugen_stk.cpp:  rate = (MY_FLOAT) ( srate / sampleRate() );
++ugen_stk.cpp:  unsigned char srate[10];
++ugen_stk.cpp:  if ( fread(&srate, 10, 1, fd) != 1 ) goto error;
++ugen_stk.cpp:  mantissa = (unsigned long) *(unsigned long *)(srate+2);
++ugen_stk.cpp:  exp = 30 - *(srate+1);
++ugen_stk.cpp:  unsigned char srate[10];      // IEEE 754 floating point format
++ugen_stk.cpp:  memset(hdr.srate, 0, 10);
++ugen_stk.cpp:  *(SINT16 *)(hdr.srate) = (SINT16) i;
++ugen_stk.cpp:  *(unsigned long *)(hdr.srate+2) = (unsigned long) rate;
++ugen_stk.cpp:  if ( fwrite(&hdr.srate, 10, 1, fd) != 1 ) goto error;
++chuck_lang.cpp:    // get srate
++chuck_lang.cpp:    t_CKFLOAT srate = SHRED->vm_ref->srate();
++chuck_lang.cpp:    t_CKINT usec = (t_CKINT)( v / srate * 1000000 );
++chuck_lang.cpp:    RETURN->v_dur = TiltSensor_setPollRate( usec ) * srate / 1000000;
++chuck_lang.cpp:    // get srate
++chuck_lang.cpp:    t_CKFLOAT srate = SHRED->vm_ref->srate();
++chuck_lang.cpp:    RETURN->v_dur = TiltSensor_getPollRate() * srate / 1000000;
+diff -rupN OLD/src/rec.ck chuck-1.3.4.0/src/rec.ck
+--- OLD/src/rec.ck	1969-12-31 19:00:00.000000000 -0500
++++ chuck-1.3.4.0/src/rec.ck	2014-10-04 16:50:57.665597394 -0400
+@@ -0,0 +1,23 @@
++// chuck this with other shreds to record to file
++// example> chuck foo.ck bar.ck rec (see also rec2.ck)
++
++// arguments: rec:<filename>
++
++// get name
++me.arg(0) => string filename;
++if( filename.length() == 0 ) "foo.wav" => filename;
++
++// pull samples from the dac
++dac => Gain g => WvOut w => blackhole;
++// this is the output file name
++filename => w.wavFilename;
++<<<"writing to file:", "'" + w.filename() + "'">>>;
++// any gain you want for the output
++.5 => g.gain;
++
++// temporary workaround to automatically close file on remove-shred
++null @=> w;
++
++// infinite time loop...
++// ctrl-c will stop it, or modify to desired duration
++while( true ) 1::second => now;
+diff -rupN OLD/test_reverbsc.ck chuck-1.3.4.0/test_reverbsc.ck
+--- OLD/test_reverbsc.ck	1969-12-31 19:00:00.000000000 -0500
++++ chuck-1.3.4.0/test_reverbsc.ck	2014-10-04 16:50:57.669597413 -0400
+@@ -0,0 +1,42 @@
++Gain g => LPF l => ReverbSC r => ADSR fade => dac;
++
++0.3 => r.mix;
++0.98 => r.size;
++15000 => r.cutoff;
++1000 => l.freq;
++2 => l.Q;
++0.8 => r.gain;
++0.1 => g.gain;
++
++120 => float totaltime;
++now + totaltime::second => time later;
++fade.set(10::ms, 0::ms, 1, 10::second);
++fun void note(int n, float t, float del)
++{
++	SawOsc s => Envelope e => g;
++	del::second => now;
++	while(now < later) 
++	{
++		1 => e.time;
++		Std.mtof(n) => s.freq;
++		e.keyOn();
++		4::second => now;
++		e.keyOff();
++		t::second => now;
++	}
++}
++
++spork ~ note(58, 4, 0);
++spork ~ note(65, 5, 3);
++spork ~ note(60, 4, 6);
++spork ~ note(69, 6, 24);
++spork ~ note(72, 6.5, 30);
++spork ~ note(74, 7, 70);
++spork ~ note(81, 9, 71);
++spork ~ note(46, 4, 50);
++spork ~ note(34, 9.5, 53);
++
++fade.keyOn();
++totaltime::second => now;
++fade.keyOff();
++10::second => now;
